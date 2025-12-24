@@ -10,6 +10,7 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.tasks import (
+    CancelGeneration,
     ChatCompletion,
     LoadModel,
     Shutdown,
@@ -32,7 +33,7 @@ from exo.shared.types.worker.runners import (
     RunnerWaitingForModel,
     RunnerWarmingUp,
 )
-from exo.utils.channels import ClosedResourceError, MpReceiver, MpSender
+from exo.utils.channels import ClosedResourceError, MpReceiver, MpSender, WouldBlock
 from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.generator.generate import mlx_generate, warmup_inference
 from exo.worker.engines.mlx.utils_mlx import (
@@ -148,6 +149,30 @@ def main(
                         assert task_params.messages[0].content is not None
                         _check_for_debug_prompts(task_params.messages[0].content)
 
+                        # Create cancellation checker that polls for CancelGeneration
+                        cancelled = False
+
+                        def check_cancelled() -> bool:
+                            nonlocal cancelled
+                            if cancelled:
+                                return True
+                            try:
+                                pending_task = task_receiver.receive_nowait()
+                                if (
+                                    isinstance(pending_task, CancelGeneration)
+                                    and pending_task.command_id == command_id
+                                ):
+                                    cancelled = True
+                                    return True
+                                # Only CancelGeneration should arrive during generation.
+                                # If something else arrives, log it - this would be a bug.
+                                logger.warning(
+                                    f"Unexpected task during generation: {type(pending_task).__name__}"
+                                )
+                            except WouldBlock:
+                                pass
+                            return False
+
                         # Generate responses using the actual MLX generation
                         for response in mlx_generate(
                             model=model,
@@ -155,6 +180,7 @@ def main(
                             sampler=sampler,
                             task=task_params,
                             kv_prefix_cache=kv_prefix_cache,
+                            is_cancelled=check_cancelled,
                         ):
                             match response:
                                 case GenerationResponse():
@@ -180,6 +206,12 @@ def main(
                             RunnerStatusUpdated(
                                 runner_id=runner_id, runner_status=RunnerReady()
                             )
+                        )
+                    case CancelGeneration():
+                        # Cancellation handled in the check_cancelled callback during generation
+                        # If we receive it here, the generation already finished
+                        logger.info(
+                            "Received CancelGeneration but generation already complete"
                         )
                     case Shutdown():
                         logger.info("runner shutting down")

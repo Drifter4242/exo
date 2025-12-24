@@ -1,3 +1,4 @@
+import time
 from typing import Any, Callable, Generator, cast, get_args
 
 import mlx.core as mx
@@ -54,6 +55,17 @@ def prefill(
         # Nothing to prefill - stream_generate will handle single token
         return
 
+    tokens_to_prefill = num_tokens - 1
+    logger.info(f"Prefilling {tokens_to_prefill} tokens...")
+    start_time = time.time()
+
+    def progress_callback(processed: int, total: int) -> None:
+        elapsed = time.time() - start_time
+        tok_per_sec = processed / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Prefill progress: {processed}/{total} tokens ({tok_per_sec:.1f} tok/s)"
+        )
+
     # Use max_tokens=1 because max_tokens=0 is buggy in some mlx_lm versions
     # We just throw away the generated token - we only care about filling the cache
     for _ in stream_generate(
@@ -63,13 +75,20 @@ def prefill(
         max_tokens=1,
         sampler=sampler,
         prompt_cache=cache,
-        prefill_step_size=65536,
+        prefill_step_size=2048,
         kv_group_size=KV_GROUP_SIZE,
         kv_bits=KV_BITS,
+        prompt_progress_callback=progress_callback,
     ):
         break  # Stop after first iteration - cache is now filled
     # Trim the extra token we generated (max_tokens=1 workaround)
     trim_prompt_cache(cache, 1)
+
+    elapsed = time.time() - start_time
+    tokens_per_sec = tokens_to_prefill / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Prefill complete: {tokens_to_prefill} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
 
 
 def warmup_inference(
@@ -125,6 +144,7 @@ def mlx_generate(
     sampler: Callable[[mx.array], mx.array],
     task: ChatCompletionTaskParams,
     kv_prefix_cache: KVPrefixCache | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> Generator[GenerationResponse]:
     # Currently we support chat-completion tasks only.
     logger.info(f"task_params: {task}")
@@ -160,6 +180,10 @@ def mlx_generate(
         kv_group_size=KV_GROUP_SIZE,
         kv_bits=KV_BITS,
     ):
+        if is_cancelled is not None and is_cancelled():
+            logger.info("Generation cancelled by client")
+            out.finish_reason = "stop"
+
         generated_text_parts.append(out.text)
         logger.info(out.text)
         if out.finish_reason is not None and out.finish_reason not in get_args(
