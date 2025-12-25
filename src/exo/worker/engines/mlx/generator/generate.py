@@ -4,6 +4,7 @@ from typing import Any, Callable, Generator, cast, get_args
 import mlx.core as mx
 from mlx_lm import stream_generate
 from mlx_lm.models.cache import KVCache, trim_prompt_cache
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.api import ChatCompletionMessage, FinishReason
@@ -14,7 +15,12 @@ from exo.shared.types.worker.runner_response import (
 )
 from exo.worker.engines.mlx import Model
 from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt
-from exo.worker.engines.mlx.constants import KV_BITS, KV_GROUP_SIZE, MAX_TOKENS
+from exo.worker.engines.mlx.constants import (
+    KV_BITS,
+    KV_GROUP_SIZE,
+    MAX_TOKENS,
+    TEMPERATURE,
+)
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     make_kv_cache,
@@ -138,16 +144,35 @@ def warmup_inference(
     return tokens_generated
 
 
+def make_sampler_from_task(
+    task: ChatCompletionTaskParams,
+) -> Callable[[mx.array], mx.array]:
+    """Create a sampler configured from task parameters.
+
+    Supports OpenAI-compatible parameters:
+    - temperature: Controls randomness (0.0 = deterministic, higher = more random)
+    - top_p: Nucleus sampling threshold (0.0 = disabled)
+
+    Note: Other OpenAI parameters like frequency_penalty, presence_penalty,
+    and logit_bias would require logit processors, not samplers.
+    """
+    temp = task.temperature if task.temperature is not None else TEMPERATURE
+    top_p = task.top_p if task.top_p is not None else 0.0
+    logger.info(f"Creating sampler with temp={temp}, top_p={top_p}")
+    return make_sampler(temp=temp, top_p=top_p)
+
+
 def mlx_generate(
     model: Model,
     tokenizer: TokenizerWrapper,
-    sampler: Callable[[mx.array], mx.array],
     task: ChatCompletionTaskParams,
     kv_prefix_cache: KVPrefixCache | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> Generator[GenerationResponse]:
     # Currently we support chat-completion tasks only.
     logger.info(f"task_params: {task}")
+
+    sampler = make_sampler_from_task(task)
 
     prompt = apply_chat_template(
         tokenizer=tokenizer,
