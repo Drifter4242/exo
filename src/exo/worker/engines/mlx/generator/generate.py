@@ -50,16 +50,19 @@ def prefill(
     sampler: Callable[[mx.array], mx.array],
     prompt_tokens: mx.array,
     cache: KVCacheType,
-) -> None:
+) -> tuple[int, float]:
     """Prefill the KV cache with prompt tokens.
 
     This runs the model over the prompt tokens to populate the cache,
     then trims off the extra generated token.
+
+    Returns:
+        tuple of (tokens_prefilled, tokens_per_sec)
     """
     num_tokens = len(prompt_tokens)
     if num_tokens <= 1:
         # Nothing to prefill - stream_generate will handle single token
-        return
+        return (0, 0.0)
 
     tokens_to_prefill = num_tokens - 1
     logger.info(f"Prefilling {tokens_to_prefill} tokens...")
@@ -91,10 +94,11 @@ def prefill(
     trim_prompt_cache(cache, 1)
 
     elapsed = time.time() - start_time
-    tokens_per_sec = tokens_to_prefill / elapsed if elapsed > 0 else 0
+    tokens_per_sec = tokens_to_prefill / elapsed if elapsed > 0 else 0.0
     logger.info(
         f"Prefill complete: {tokens_to_prefill} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
+    return (tokens_to_prefill, tokens_per_sec)
 
 
 def warmup_inference(
@@ -224,13 +228,16 @@ def mlx_generate(
         prompt_tokens = encode_prompt(tokenizer, prompt)
 
     # Prefill cache with all tokens except the last one
-    prefill(model, tokenizer, sampler, prompt_tokens, caches)
+    prefill_tokens, prefill_tps = prefill(
+        model, tokenizer, sampler, prompt_tokens, caches
+    )
 
     # stream_generate starts from the last token
     last_token = prompt_tokens[-1:]
 
     max_tokens = task.max_tokens or MAX_TOKENS
     generated_text_parts: list[str] = []
+    generation_start_time = time.time()
     for out in stream_generate(
         model=model,
         tokenizer=tokenizer,
@@ -265,6 +272,16 @@ def mlx_generate(
         )
 
         if out.finish_reason is not None:
+            # Log generation stats
+            generation_elapsed = time.time() - generation_start_time
+            generated_tokens = len(generated_text_parts)
+            generation_tps = (
+                generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
+            )
+            logger.info(
+                f"Generation complete: prefill {prefill_tokens} tokens @ {prefill_tps:.1f} tok/s, "
+                f"generated {generated_tokens} tokens @ {generation_tps:.1f} tok/s"
+            )
             # Save cache for future prefix matching (clear first to keep only the last one)
             if kv_prefix_cache is not None:
                 kv_prefix_cache.clear()

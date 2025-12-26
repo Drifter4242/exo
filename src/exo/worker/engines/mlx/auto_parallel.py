@@ -1,3 +1,4 @@
+# pyright: reportUnknownMemberType=false
 from abc import ABC, abstractmethod
 from functools import partial
 from inspect import signature
