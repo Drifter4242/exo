@@ -57,6 +57,9 @@ class SwiGLU(nn.Module):
     def __call__(self, x, gate): ...
 
 class SwitchGLU(nn.Module):
+    gate_proj: SwitchLinear
+    up_proj: SwitchLinear
+    down_proj: SwitchLinear
     def __init__(
         self,
         input_dims: int,
