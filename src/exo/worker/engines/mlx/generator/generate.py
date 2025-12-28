@@ -4,6 +4,7 @@ from typing import Any, Callable, Generator, cast, get_args
 import mlx.core as mx
 from mlx_lm import stream_generate
 from mlx_lm.models.cache import KVCache, trim_prompt_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.api import ChatCompletionMessage, FinishReason
@@ -143,16 +144,73 @@ def warmup_inference(
     return tokens_generated
 
 
+def make_sampler_from_task(
+    task: ChatCompletionTaskParams,
+) -> Callable[[mx.array], mx.array]:
+    """Create a sampler configured from task parameters.
+
+    Supports OpenAI-compatible parameters:
+    - temperature: Controls randomness (0.0 = deterministic, higher = more random)
+    - top_p: Nucleus sampling threshold (0.0 = disabled)
+    """
+    temp = task.temperature if task.temperature is not None else 0.7
+    top_p = task.top_p if task.top_p is not None else 0.0
+    logger.info(f"Creating sampler with temp={temp}, top_p={top_p}")
+    return make_sampler(temp=temp, top_p=top_p)
+
+
+def make_logits_processors_from_task(
+    task: ChatCompletionTaskParams,
+) -> list[Callable[[mx.array, mx.array], mx.array]]:
+    """Create logits processors configured from task parameters.
+
+    Supports OpenAI-compatible parameters:
+    - logit_bias: Dict of token_id -> bias to add to logits
+    - frequency_penalty: Mapped to repetition_penalty (similar but not identical)
+
+    Note: presence_penalty is not directly supported by mlx_lm.
+    frequency_penalty in OpenAI penalizes based on frequency in generated text,
+    while repetition_penalty in mlx_lm penalizes any repetition in context window.
+    """
+    # Convert logit_bias from OpenAI format (str keys) to mlx_lm format (int keys)
+    logit_bias: dict[int, float] | None = None
+    if task.logit_bias:
+        logit_bias = {int(k): float(v) for k, v in task.logit_bias.items()}
+
+    # Map frequency_penalty to repetition_penalty
+    # OpenAI range: -2.0 to 2.0, mlx_lm expects positive values where 1.0 = no penalty
+    repetition_penalty: float | None = None
+    if task.frequency_penalty is not None and task.frequency_penalty != 0.0:
+        # Convert: OpenAI 0.0 -> mlx 1.0, OpenAI 2.0 -> mlx ~1.5
+        # This is an approximation - the algorithms differ
+        repetition_penalty = 1.0 + (task.frequency_penalty * 0.25)
+
+    processors = make_logits_processors(
+        logit_bias=logit_bias,
+        repetition_penalty=repetition_penalty,
+    )
+
+    if processors:
+        logger.info(
+            f"Created logits processors: logit_bias={logit_bias is not None}, "
+            f"repetition_penalty={repetition_penalty}"
+        )
+
+    return processors
+
+
 def mlx_generate(
     model: Model,
     tokenizer: TokenizerWrapper,
-    sampler: Callable[[mx.array], mx.array],
     task: ChatCompletionTaskParams,
     kv_prefix_cache: KVPrefixCache | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> Generator[GenerationResponse]:
     # Currently we support chat-completion tasks only.
     logger.info(f"task_params: {task}")
+
+    sampler = make_sampler_from_task(task)
+    logits_processors = make_logits_processors_from_task(task)
 
     prompt = apply_chat_template(
         tokenizer=tokenizer,
@@ -183,6 +241,7 @@ def mlx_generate(
         prompt=last_token,
         max_tokens=max_tokens,
         sampler=sampler,
+        logits_processors=logits_processors if logits_processors else None,
         prompt_cache=caches,
         prefill_step_size=65536,
         kv_group_size=KV_GROUP_SIZE,

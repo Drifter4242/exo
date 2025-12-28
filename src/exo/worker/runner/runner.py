@@ -187,7 +187,6 @@ def main(
                         for response in mlx_generate(
                             model=model,
                             tokenizer=tokenizer,
-                            sampler=sampler,
                             task=task_params,
                             kv_prefix_cache=kv_prefix_cache,
                             is_cancelled=check_cancelled,
