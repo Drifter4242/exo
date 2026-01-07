@@ -38,6 +38,7 @@ from exo.shared.types.worker.runners import (
     RunnerWarmingUp,
 )
 from exo.utils.channels import ClosedResourceError, MpReceiver, MpSender, WouldBlock
+from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.generator.generate import mlx_generate, warmup_inference
 from exo.worker.engines.mlx.utils_mlx import (
     initialize_mlx,
@@ -72,6 +73,7 @@ def main(
         tokenizer = None
         sampler = None
         group = None
+        kv_prefix_cache: KVPrefixCache | None = None
 
         current_status: RunnerStatus = RunnerIdle()
         logger.info("runner created")
@@ -118,6 +120,7 @@ def main(
                         model, tokenizer, sampler = load_mlx_items(
                             bound_instance, group
                         )
+                        kv_prefix_cache = KVPrefixCache()
 
                         current_status = RunnerLoaded()
                         logger.info("runner loaded")
@@ -169,6 +172,7 @@ def main(
                             model=model,
                             tokenizer=tokenizer,
                             task=task_params,
+                            kv_prefix_cache=kv_prefix_cache,
                         ):
                             # Check dedicated cancel channel for cancellation
                             # Drain all pending cancellations to handle stale ones
