@@ -181,7 +181,13 @@ def get_hosts_from_subgraph(cycle_digraph: Topology) -> list[Host]:
                 connection.local_node_id == current_node.node_id
                 and connection.send_back_node_id == next_node.node_id
             ):
-                if get_thunderbolt and not connection.is_thunderbolt():
+                # Use topology method for reliable Thunderbolt Bridge detection
+                if (
+                    get_thunderbolt
+                    and not cycle_digraph.is_connection_on_thunderbolt_bridge(
+                        connection
+                    )
+                ):
                     continue
                 assert connection.send_back_multiaddr is not None
                 host = Host(
@@ -293,14 +299,20 @@ def _find_ip_prioritised(
     """Find an IP address between nodes with prioritization.
 
     Priority order:
-    1. en0 (Ethernet on Mac Studio, WiFi on MacBook)
-    2. en1 (WiFi on Mac Studio, Ethernet on MacBook)
-    3. Non-Thunderbolt connections
-    4. Any other IP address
+    1. bridge* (Thunderbolt bridge interfaces)
+    2. en0 (Ethernet on Mac Studio, WiFi on MacBook)
+    3. en1 (WiFi on Mac Studio, Ethernet on MacBook)
+    4. Non-Thunderbolt connections
+    5. Any other IP address
     """
     ips = list(_find_connection_ip(node, other_node, cycle_digraph))
     # We expect a unique iface -> ip mapping
     iface_map = {_find_interface_name_for_ip(ip, other_node): ip for ip, _ in ips}
+
+    # Check for bridge interfaces first (thunderbolt bridge)
+    for iface, ip in iface_map.items():
+        if iface and iface.startswith("bridge") and iface[6:].isdigit():
+            return ip
 
     en0_ip = iface_map.get("en0")
     if en0_ip:
