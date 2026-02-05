@@ -12,6 +12,7 @@ from exo.shared.types.commands import (
     CommandId,
     ForwarderCommand,
     ForwarderDownloadCommand,
+    ForwarderWorkerCommand,
     PlaceInstance,
     TextGeneration,
 )
@@ -48,7 +49,8 @@ async def test_master():
     ge_sender, global_event_receiver = channel[ForwarderEvent]()
     command_sender, co_receiver = channel[ForwarderCommand]()
     local_event_sender, le_receiver = channel[ForwarderEvent]()
-    fcds, _fcdr = channel[ForwarderDownloadCommand]()
+    worker_command_sender, _worker_command_receiver = channel[ForwarderWorkerCommand]()
+    download_command_sender, _download_command_receiver = channel[ForwarderDownloadCommand]()
 
     all_events: list[IndexedEvent] = []
 
@@ -69,7 +71,8 @@ async def test_master():
         global_event_sender=ge_sender,
         local_event_receiver=le_receiver,
         command_receiver=co_receiver,
-        download_command_sender=fcds,
+        download_command_sender=download_command_sender,
+        worker_command_sender=worker_command_sender,
     )
     logger.info("run the master")
     async with anyio.create_task_group() as tg:

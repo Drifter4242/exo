@@ -33,6 +33,7 @@ from exo.shared.types.events import (
     TracesCollected,
 )
 from exo.shared.types.tasks import (
+    CancelGeneration,
     ConnectToGroup,
     ImageEdits,
     ImageGeneration,
@@ -72,7 +73,7 @@ from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
     ShardMetadata,
 )
-from exo.utils.channels import MpReceiver, MpSender
+from exo.utils.channels import MpReceiver, MpSender, WouldBlock
 from exo.worker.engines.image import (
     DistributedImageModel,
     generate_image,
@@ -112,6 +113,7 @@ def main(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event],
     task_receiver: MpReceiver[Task],
+    cancel_receiver: MpReceiver[CancelGeneration],
 ):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
@@ -368,6 +370,29 @@ def main(
                                             )
                                         )
 
+                            # Explicit cancellation check after each chunk
+                            # Drain all pending cancellations to handle stale ones
+                            while True:
+                                try:
+                                    cancel_task = cancel_receiver.receive_nowait()
+                                    if cancel_task.command_id == command_id:
+                                        logger.info(
+                                            "Generation cancelled mid-stream by client disconnect"
+                                        )
+                                        break
+                                    else:
+                                        # Stale cancellation for a different command - ignore
+                                        logger.debug(
+                                            f"Ignoring stale CancelGeneration for {cancel_task.command_id}"
+                                        )
+                                except WouldBlock:
+                                    break
+                            else:
+                                # while loop completed without break (no cancellation)
+                                continue
+                            # Cancelled - break out of for loop
+                            break
+
                     # can we make this more explicit?
                     except Exception as e:
                         if device_rank == 0:
@@ -385,6 +410,12 @@ def main(
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
+                case CancelGeneration():
+                    # Cancellation handled in explicit check after each chunk during generation
+                    # If we receive it here, the generation already finished
+                    logger.info(
+                        "Received CancelGeneration but generation already complete"
+                    )
                 case ImageGeneration(
                     task_params=task_params, command_id=command_id
                 ) if isinstance(current_status, RunnerReady):

@@ -50,6 +50,7 @@ class Node:
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)
+        await router.register_topic(topics.WORKER_COMMANDS)
         await router.register_topic(topics.ELECTION_MESSAGES)
         await router.register_topic(topics.CONNECTION_MESSAGES)
         await router.register_topic(topics.DOWNLOAD_COMMANDS)
@@ -94,6 +95,7 @@ class Node:
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
                 event_index_counter=event_index_counter,
+                worker_command_receiver=router.receiver(topics.WORKER_COMMANDS),
             )
         else:
             worker = None
@@ -106,6 +108,7 @@ class Node:
             local_event_receiver=router.receiver(topics.LOCAL_EVENTS),
             command_receiver=router.receiver(topics.COMMANDS),
             download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
+            worker_command_sender=router.sender(topics.WORKER_COMMANDS),
         )
 
         er_send, er_recv = channel[ElectionResult]()
@@ -192,6 +195,9 @@ class Node:
                         download_command_sender=self.router.sender(
                             topics.DOWNLOAD_COMMANDS
                         ),
+                        worker_command_sender=self.router.sender(
+                            topics.WORKER_COMMANDS
+                        ),
                     )
                     self._tg.start_soon(self.master.run)
                 elif (
@@ -239,6 +245,9 @@ class Node:
                                 topics.DOWNLOAD_COMMANDS
                             ),
                             event_index_counter=self.event_index_counter,
+                            worker_command_receiver=self.router.receiver(
+                                topics.WORKER_COMMANDS
+                            ),
                         )
                         self._tg.start_soon(self.worker.run)
                     if self.api:

@@ -1,6 +1,7 @@
 import time
+from collections.abc import Callable
 from copy import deepcopy
-from typing import Callable, Generator, cast, get_args
+from typing import Generator, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import stream_generate

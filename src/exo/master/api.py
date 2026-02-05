@@ -11,7 +11,7 @@ from typing import Annotated, Literal, cast
 from uuid import uuid4
 
 import anyio
-from anyio import BrokenResourceError, create_task_group
+from anyio import BrokenResourceError, ClosedResourceError, create_task_group
 from anyio.abc import TaskGroup
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,6 +125,7 @@ from exo.shared.types.commands import (
     PlaceInstance,
     SendInputChunk,
     StartDownload,
+    TaskCancelled,
     TaskFinished,
     TextGeneration,
 )
@@ -540,17 +541,22 @@ class API:
                         break
 
         except anyio.get_cancelled_exc_class():
-            # TODO: TaskCancelled
-            """
-            self.command_sender.send_nowait(
-                ForwarderCommand(origin=self.node_id, command=command)
-            )
-            """
-            raise
-        finally:
-            command = TaskFinished(finished_command_id=command_id)
-            await self._send(command)
+            # Client disconnected - send cancellation to stop generation
+            logger.info(f"Client disconnected, cancelling command {command_id}")
+            cancel_command = TaskCancelled(cancelled_command_id=command_id)
+            # Shield from cancellation with timeout so we don't hang forever
+            with anyio.fail_after(1.0, shield=True):
+                await self._send(cancel_command)
+            # Don't send TaskFinished - TaskCancelled will handle cleanup
             if command_id in self._text_generation_queues:
+                del self._text_generation_queues[command_id]
+            # Don't re-raise - just return to end the generator cleanly
+            return
+        finally:
+            # Only send TaskFinished if not cancelled (queue still exists)
+            if command_id in self._text_generation_queues:
+                command = TaskFinished(finished_command_id=command_id)
+                await self._send(command)
                 del self._text_generation_queues[command_id]
 
     async def _collect_text_generation_with_stats(
@@ -1409,7 +1415,11 @@ class API:
                             assert not isinstance(event.chunk, ImageChunk)
                             try:
                                 await queue.send(event.chunk)
-                            except BrokenResourceError:
+                            except (BrokenResourceError, ClosedResourceError):
+                                # Client disconnected - ignore late chunks
+                                logger.debug(
+                                    f"Dropping chunk for disconnected client {event.command_id}"
+                                )
                                 self._text_generation_queues.pop(event.command_id, None)
 
                     if isinstance(event, TracesMerged):

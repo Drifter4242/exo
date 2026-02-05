@@ -39,6 +39,11 @@ class TaskAcknowledged(BaseEvent):
     task_id: TaskId
 
 
+class TaskCancellationRequested(BaseEvent):
+    """Emitted when a client disconnects and their in-flight generation should be cancelled."""
+    command_id: CommandId
+
+
 class TaskDeleted(BaseEvent):
     task_id: TaskId
 

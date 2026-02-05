@@ -12,8 +12,10 @@ from exo.shared.apply import apply
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.api import ImageEditsTaskParams
 from exo.shared.types.commands import (
+    CancelGenerationCommand,
     ForwarderCommand,
     ForwarderDownloadCommand,
+    ForwarderWorkerCommand,
     RequestEventLog,
     StartDownload,
 )
@@ -33,6 +35,7 @@ from exo.shared.types.events import (
 from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
+    CancelGeneration,
     CreateRunner,
     DownloadModel,
     ImageEdits,
@@ -64,6 +67,8 @@ class Worker:
         command_sender: Sender[ForwarderCommand],
         download_command_sender: Sender[ForwarderDownloadCommand],
         event_index_counter: Iterator[int],
+        # Receive direct commands from master (bypasses event log)
+        worker_command_receiver: Receiver[ForwarderWorkerCommand],
     ):
         self.node_id: NodeId = node_id
         self.session_id: SessionId = session_id
@@ -73,6 +78,7 @@ class Worker:
         self.event_index_counter = event_index_counter
         self.command_sender = command_sender
         self.download_command_sender = download_command_sender
+        self.worker_command_receiver = worker_command_receiver
         self.event_buffer = OrderedBuffer[Event]()
         self.out_for_delivery: dict[EventId, ForwarderEvent] = {}
 
@@ -108,6 +114,7 @@ class Worker:
                 tg.start_soon(self._event_applier)
                 tg.start_soon(self._forward_events)
                 tg.start_soon(self._poll_connection_updates)
+                tg.start_soon(self._worker_command_processor)
         finally:
             # Actual shutdown code - waits for all tasks to complete before executing.
             logger.info("Stopping Worker")
@@ -168,6 +175,27 @@ class Worker:
                         self.input_chunk_buffer[cmd_id][event.chunk.chunk_index] = (
                             event.chunk.data
                         )
+
+    async def _worker_command_processor(self):
+        """Process direct commands from master (bypasses event log)."""
+        async for forwarder_cmd in self.worker_command_receiver:
+            cmd = forwarder_cmd.command
+            match cmd:
+                case CancelGenerationCommand():
+                    self._handle_cancel_generation_command(cmd)
+
+    def _handle_cancel_generation_command(self, cmd: CancelGenerationCommand):
+        """Handle a direct cancellation command from master."""
+        for runner in self.runners.values():
+            # Send cancellation to all runners. The runner will check command_id
+            cancel_task = CancelGeneration(
+                command_id=cmd.command_id_to_cancel,
+                instance_id=runner.bound_instance.instance.instance_id,
+            )
+            runner.send_task_nowait(cancel_task)
+            logger.info(
+                f"Sent CancelGeneration for command {cmd.command_id_to_cancel} to runner"
+            )
 
     async def plan_step(self):
         while True:

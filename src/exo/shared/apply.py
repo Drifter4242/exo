@@ -18,6 +18,7 @@ from exo.shared.types.events import (
     RunnerDeleted,
     RunnerStatusUpdated,
     TaskAcknowledged,
+    TaskCancellationRequested,
     TaskCreated,
     TaskDeleted,
     TaskFailed,
@@ -64,6 +65,7 @@ def event_apply(event: Event, state: State) -> State:
             | ChunkGenerated()
             | TaskAcknowledged()
             | InputChunkReceived()
+            | TaskCancellationRequested()
             | TracesCollected()
             | TracesMerged()
         ):  # Pass-through events that don't modify state

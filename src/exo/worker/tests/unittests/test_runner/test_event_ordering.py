@@ -14,6 +14,7 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.tasks import (
+    CancelGeneration,
     ConnectToGroup,
     LoadModel,
     Shutdown,
@@ -164,8 +165,9 @@ def _run(tasks: Iterable[Task]):
 
     task_sender, task_receiver = mp_channel[Task]()
     event_sender = EventCollector()
+    cancel_sender, cancel_receiver = mp_channel[CancelGeneration]()
 
-    with task_sender:
+    with task_sender, cancel_sender:
         for t in tasks:
             task_sender.send(t)
 
@@ -173,8 +175,10 @@ def _run(tasks: Iterable[Task]):
         # this is some c++ nonsense
         task_receiver.close = nothin
         task_receiver.join = nothin
+        cancel_receiver.close = nothin
+        cancel_receiver.join = nothin
 
-        mlx_runner.main(bound_instance, event_sender, task_receiver)  # type: ignore[arg-type]
+        mlx_runner.main(bound_instance, event_sender, task_receiver, cancel_receiver)  # type: ignore[arg-type]
 
         return event_sender.events
 
