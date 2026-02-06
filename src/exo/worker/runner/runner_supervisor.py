@@ -148,7 +148,9 @@ class RunnerSupervisor:
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
                     if isinstance(event, TaskAcknowledged):
-                        self.pending.pop(event.task_id).set()
+                        # Don't pop - keep in pending for deduplication until Complete
+                        if event.task_id in self.pending:
+                            self.pending[event.task_id].set()
                         continue
                     if (
                         isinstance(event, TaskStatusUpdated)
@@ -165,6 +167,8 @@ class RunnerSupervisor:
                                 RunnerShuttingDown,
                             ),
                         )
+                        # Now remove from pending and add to completed
+                        self.pending.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
             except (ClosedResourceError, BrokenResourceError) as e:

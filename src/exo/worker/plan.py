@@ -297,10 +297,15 @@ def _pending_tasks(
             # the actual solution is somewhat deeper than this bypass - TODO!
             if task.task_id in runner.completed:
                 continue
+            
+            # Don't dispatch tasks that are already pending/in-flight
+            if task.task_id in runner.pending:
+                continue
 
             # TODO: Check ordering aligns with MLX distributeds expectations.
+            # Allow dispatch when Ready (first task) or Running (batch mode - additional tasks)
 
-            if isinstance(runner.status, RunnerReady) and all(
+            if isinstance(runner.status, (RunnerReady, RunnerRunning)) and all(
                 isinstance(all_runners[global_runner_id], (RunnerReady, RunnerRunning))
                 for global_runner_id in runner.bound_instance.instance.shard_assignments.runner_to_shard
             ):

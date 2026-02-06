@@ -20,7 +20,13 @@ from pydantic import ValidationError
 from exo.shared.constants import EXO_MAX_CHUNK_SIZE, EXO_TRACING_ENABLED
 from exo.shared.models.model_cards import ModelId, ModelTask
 from exo.shared.tracing import clear_trace_buffer, get_trace_buffer
-from exo.shared.types.api import ImageGenerationStats
+from exo.shared.types.api import (
+    CompletionTokensDetails,
+    GenerationStats,
+    ImageGenerationStats,
+    PromptTokensDetails,
+    Usage,
+)
 from exo.shared.types.chunks import ErrorChunk, ImageChunk, TokenChunk, ToolCallChunk
 from exo.shared.types.common import CommandId
 from exo.shared.types.events import (
@@ -32,7 +38,9 @@ from exo.shared.types.events import (
     TraceEventData,
     TracesCollected,
 )
+from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import (
+    CancelGeneration,
     ConnectToGroup,
     ImageEdits,
     ImageGeneration,
@@ -72,7 +80,7 @@ from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
     ShardMetadata,
 )
-from exo.utils.channels import MpReceiver, MpSender
+from exo.utils.channels import MpReceiver, MpSender, WouldBlock
 from exo.worker.engines.image import (
     DistributedImageModel,
     generate_image,
@@ -89,7 +97,22 @@ from exo.worker.engines.mlx.utils_mlx import (
     load_mlx_items,
     mlx_force_oom,
 )
+from exo.worker.runner.batch_generate import (
+    BATCH_ENABLED,
+    BatchState,
+    BatchTokenEvent,
+    batch_generate,
+    cancel_batch_request,
+    finish_batch_request,
+    init_batch_generator,
+    insert_batch_request,
+)
 from exo.worker.runner.bootstrap import logger
+from exo.worker.runner.token_processing import (
+    check_stop_sequence,
+    should_filter_kimi_token,
+    validate_single_tool,
+)
 
 
 def _is_primary_output_node(shard_metadata: ShardMetadata) -> bool:
@@ -134,6 +157,7 @@ def main(
     tokenizer = None
     group = None
     kv_prefix_cache: KVPrefixCache | None = None
+    batch_state: BatchState = BatchState()
 
     current_status: RunnerStatus = RunnerIdle()
     logger.info("runner created")
@@ -197,7 +221,15 @@ def main(
                         logger.info(
                             f"model has_tool_calling={tokenizer.has_tool_calling}"
                         )
-                        kv_prefix_cache = KVPrefixCache(group)
+                        kv_prefix_cache = KVPrefixCache(tokenizer, group)
+                        
+                        # Patch tokenizers at load time so they're available for both batch and non-batch paths
+                        if "kimi" in shard_metadata.model_card.model_id.lower():
+                            patch_kimi_tokenizer(tokenizer)
+                            logger.info("Patched Kimi tokenizer for tool calling")
+                        elif "glm" in shard_metadata.model_card.model_id.lower():
+                            patch_glm_tokenizer(tokenizer)
+                            logger.info("Patched GLM tokenizer for tool calling")
 
                     elif (
                         ModelTask.TextToImage in shard_metadata.model_card.tasks
@@ -266,122 +298,185 @@ def main(
                     assert model and not isinstance(model, DistributedImageModel)
                     assert tokenizer
 
+                    use_batch = BATCH_ENABLED
+
                     try:
                         _check_for_debug_prompts(task_params)
 
-                        # Build prompt once - used for both generation and thinking detection
-                        prompt = apply_chat_template(tokenizer, task_params)
+                        if use_batch:
+                            # === BATCHED GENERATION PATH ===
+                            model_id = shard_metadata.model_card.model_id
+                            
+                            # Initialize BatchGenerator if needed
+                            init_batch_generator(batch_state, model, tokenizer)
+                            
+                            # Insert request into batch
+                            insert_batch_request(
+                                batch_state=batch_state,
+                                task_id=task.task_id,
+                                command_id=command_id,
+                                task_params=task_params,
+                                tokenizer=tokenizer,
+                                model_id=model_id,
+                            )
+                            
+                            # Run batch generation loop
+                            while batch_state.is_active():
+                                # Check for new tasks or cancellations
+                                _handle_batch_tasks(
+                                    batch_state, task_receiver, event_sender,
+                                    tokenizer, model_id, runner_id, device_rank,
+                                )
+                                
+                                # Generate one step of tokens for all requests
+                                for event in batch_generate(batch_state, tokenizer):
+                                    _process_batch_token(
+                                        event, batch_state, event_sender,
+                                        model_id, device_rank,
+                                    )
+                        else:
+                            # === ORIGINAL SINGLE-REQUEST PATH ===
+                            # Build prompt once - used for both generation and thinking detection
+                            prompt = apply_chat_template(tokenizer, task_params)
 
-                        # Generate responses using the actual MLX generation
-                        mlx_generator = mlx_generate(
-                            model=model,
-                            tokenizer=tokenizer,
-                            task=task_params,
-                            prompt=prompt,
-                            kv_prefix_cache=kv_prefix_cache,
-                            group=group,
-                        )
-
-                        # For other thinking models (GLM, etc.), check if we need to
-                        # prepend the thinking tag that was consumed by the chat template
-                        if detect_thinking_prompt_suffix(prompt, tokenizer):
-                            mlx_generator = parse_thinking_models(
-                                mlx_generator, tokenizer
+                            # Generate responses using the actual MLX generation
+                            mlx_generator = mlx_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                task=task_params,
+                                prompt=prompt,
+                                kv_prefix_cache=kv_prefix_cache,
+                                group=group,
                             )
 
-                        # Kimi-K2 has tool call sections - we don't care about them
-                        if "kimi" in shard_metadata.model_card.model_id.lower():
-                            mlx_generator = filter_kimi_tokens(mlx_generator)
-                            patch_kimi_tokenizer(tokenizer)
+                            # For other thinking models (GLM, etc.), check if we need to
+                            # prepend the thinking tag that was consumed by the chat template
+                            if detect_thinking_prompt_suffix(prompt, tokenizer):
+                                mlx_generator = parse_thinking_models(
+                                    mlx_generator, tokenizer
+                                )
 
-                        # GLM models need patched parser (upstream has bug with None regex match)
-                        elif "glm" in shard_metadata.model_card.model_id.lower():
-                            patch_glm_tokenizer(tokenizer)
+                            # Kimi-K2 has tool call sections - we don't care about them
+                            if "kimi" in shard_metadata.model_card.model_id.lower():
+                                mlx_generator = filter_kimi_tokens(mlx_generator)
+                                # patch_kimi_tokenizer already called at model load time
 
-                        # GPT-OSS specific parsing to match other model formats.
-                        elif isinstance(model, GptOssModel):
-                            mlx_generator = parse_gpt_oss(mlx_generator)
+                            # GLM models - patch_glm_tokenizer already called at model load time
 
-                        if tokenizer.has_tool_calling and not isinstance(
-                            model, GptOssModel
-                        ):
-                            assert tokenizer.tool_call_start
-                            assert tokenizer.tool_call_end
-                            assert tokenizer.tool_parser  # pyright: ignore[reportAny]
-                            mlx_generator = parse_tool_calls(
-                                mlx_generator,
-                                tokenizer.tool_call_start,
-                                tokenizer.tool_call_end,
-                                tokenizer.tool_parser,  # pyright: ignore[reportAny]
-                            )
+                            # GPT-OSS specific parsing to match other model formats.
+                            elif isinstance(model, GptOssModel):
+                                mlx_generator = parse_gpt_oss(mlx_generator)
 
-                        completion_tokens = 0
-                        for response in mlx_generator:
-                            match response:
-                                case GenerationResponse():
-                                    completion_tokens += 1
-                                    if (
-                                        device_rank == 0
-                                        and response.finish_reason == "error"
-                                    ):
-                                        event_sender.send(
-                                            ChunkGenerated(
-                                                command_id=command_id,
-                                                chunk=ErrorChunk(
-                                                    error_message=response.text,
-                                                    model=shard_metadata.model_card.model_id,
-                                                ),
+                            if tokenizer.has_tool_calling and not isinstance(
+                                model, GptOssModel
+                            ):
+                                assert tokenizer.tool_call_start
+                                assert tokenizer.tool_call_end
+                                assert tokenizer.tool_parser  # pyright: ignore[reportAny]
+                                mlx_generator = parse_tool_calls(
+                                    mlx_generator,
+                                    tokenizer.tool_call_start,
+                                    tokenizer.tool_call_end,
+                                    tokenizer.tool_parser,  # pyright: ignore[reportAny]
+                                )
+
+                            completion_tokens = 0
+                            for response in mlx_generator:
+                                match response:
+                                    case GenerationResponse():
+                                        completion_tokens += 1
+                                        if (
+                                            device_rank == 0
+                                            and response.finish_reason == "error"
+                                        ):
+                                            event_sender.send(
+                                                ChunkGenerated(
+                                                    command_id=command_id,
+                                                    chunk=ErrorChunk(
+                                                        error_message=response.text,
+                                                        model=shard_metadata.model_card.model_id,
+                                                    ),
+                                                )
                                             )
-                                        )
 
-                                    elif device_rank == 0:
-                                        assert response.finish_reason not in (
-                                            "error",
-                                            "tool_calls",
-                                            "function_call",
-                                        )
-                                        event_sender.send(
-                                            ChunkGenerated(
-                                                command_id=command_id,
-                                                chunk=TokenChunk(
-                                                    model=shard_metadata.model_card.model_id,
-                                                    text=response.text,
-                                                    token_id=response.token,
-                                                    usage=response.usage,
-                                                    finish_reason=response.finish_reason,
-                                                    stats=response.stats,
-                                                    logprob=response.logprob,
-                                                    top_logprobs=response.top_logprobs,
-                                                ),
+                                        elif device_rank == 0:
+                                            assert response.finish_reason not in (
+                                                "error",
+                                                "tool_calls",
+                                                "function_call",
                                             )
-                                        )
-                                case ToolCallResponse():
-                                    if device_rank == 0:
-                                        event_sender.send(
-                                            ChunkGenerated(
-                                                command_id=command_id,
-                                                chunk=ToolCallChunk(
-                                                    tool_calls=response.tool_calls,
-                                                    model=shard_metadata.model_card.model_id,
-                                                    usage=response.usage,
-                                                ),
+                                            event_sender.send(
+                                                ChunkGenerated(
+                                                    command_id=command_id,
+                                                    chunk=TokenChunk(
+                                                        model=shard_metadata.model_card.model_id,
+                                                        text=response.text,
+                                                        token_id=response.token,
+                                                        usage=response.usage,
+                                                        finish_reason=response.finish_reason,
+                                                        stats=response.stats,
+                                                        logprob=response.logprob,
+                                                        top_logprobs=response.top_logprobs,
+                                                    ),
+                                                )
                                             )
-                                        )
+                                    case ToolCallResponse():
+                                        if device_rank == 0:
+                                            event_sender.send(
+                                                ChunkGenerated(
+                                                    command_id=command_id,
+                                                    chunk=ToolCallChunk(
+                                                        tool_calls=response.tool_calls,
+                                                        model=shard_metadata.model_card.model_id,
+                                                        usage=response.usage,
+                                                    ),
+                                                )
+                                            )
 
                     # can we make this more explicit?
                     except Exception as e:
                         if device_rank == 0:
-                            event_sender.send(
-                                ChunkGenerated(
-                                    command_id=command_id,
-                                    chunk=ErrorChunk(
-                                        model=shard_metadata.model_card.model_id,
-                                        finish_reason="error",
-                                        error_message=str(e),
-                                    ),
+                            # In batch mode, send error to all active requests
+                            if BATCH_ENABLED and batch_state.is_active():
+                                for _uid, request in list(batch_state.requests.items()):
+                                    event_sender.send(
+                                        ChunkGenerated(
+                                            command_id=request.command_id,
+                                            chunk=ErrorChunk(
+                                                model=shard_metadata.model_card.model_id,
+                                                finish_reason="error",
+                                                error_message=str(e),
+                                            ),
+                                        )
+                                    )
+                                    event_sender.send(
+                                        TaskStatusUpdated(task_id=request.task_id, task_status=TaskStatus.Complete)
+                                    )
+                                # Clear the batch state
+                                batch_state.requests.clear()
+                                batch_state.command_to_uid.clear()
+                                if batch_state.generator:
+                                    batch_state.generator.close()
+                                    batch_state.generator = None
+                            else:
+                                # Single request mode
+                                event_sender.send(
+                                    ChunkGenerated(
+                                        command_id=command_id,
+                                        chunk=ErrorChunk(
+                                            model=shard_metadata.model_card.model_id,
+                                            finish_reason="error",
+                                            error_message=str(e),
+                                        ),
+                                    )
                                 )
-                            )
                         raise
+                    finally:
+                        # Send traces for single-request path (batch path sends traces per-request)
+                        if not use_batch:
+                            _send_traces_if_enabled(
+                                event_sender, task.task_id, shard_metadata.device_rank
+                            )
 
                     current_status = RunnerReady()
                     logger.info("runner ready")
@@ -547,12 +642,10 @@ def get_gpt_oss_encoding():
 def filter_kimi_tokens(
     responses: Generator[GenerationResponse | ToolCallResponse],
 ) -> Generator[GenerationResponse]:
+    """Filter out Kimi tool call section markers from the token stream."""
     for resp in responses:
         assert isinstance(resp, GenerationResponse)
-        if (
-            resp.text == "<|tool_calls_section_begin|>"
-            or resp.text == "<|tool_calls_section_end|>"
-        ):
+        if should_filter_kimi_token(resp.text):
             continue
         yield resp
 
@@ -761,9 +854,9 @@ def parse_tool_calls(
                 parsed = tool_parser("".join(tool_call_text_parts).strip())
                 logger.info(f"parsed {tool_call_text_parts=} into {parsed=}")
                 if isinstance(parsed, list):
-                    tools = [_validate_single_tool(tool) for tool in parsed]
+                    tools = [validate_single_tool(tool) for tool in parsed]
                 else:
-                    tools = [_validate_single_tool(parsed)]
+                    tools = [validate_single_tool(parsed)]
                 yield ToolCallResponse(tool_calls=tools, usage=response.usage)
 
             except (
@@ -975,3 +1068,233 @@ def _check_for_debug_prompts(task_params: TextGenerationTaskParams) -> None:
         mlx_force_oom()
     if EXO_RUNNER_MUST_TIMEOUT in prompt:
         time.sleep(100)
+
+
+# -----------------------------------------------------------------------------
+# Batch Generation Helpers
+# -----------------------------------------------------------------------------
+
+def _handle_batch_tasks(
+    batch_state: BatchState,
+    task_receiver: MpReceiver[Task],
+    event_sender: MpSender[Event],
+    tokenizer: TokenizerWrapper,
+    model_id: str,
+    runner_id: str,
+    device_rank: int,
+) -> None:
+    """Check for and handle new tasks or cancellations during batch generation."""
+    while True:
+        try:
+            new_task = task_receiver.receive_nowait()
+        except WouldBlock:
+            break
+
+        if isinstance(new_task, CancelGeneration):
+            cancel_cmd_id = new_task.command_id
+            cancelled = cancel_batch_request(batch_state, cancel_cmd_id)
+            if cancelled:
+                logger.info(f"Cancelled batch request for command {cancel_cmd_id}")
+                state = cancelled.state
+                
+                # Calculate timing stats
+                now = time.perf_counter()
+                prompt_time = state.first_token_time - state.generation_start_time if state.first_token_time > 0 else 0.001
+                generation_time = now - state.first_token_time if state.first_token_time > 0 else 0.001
+                
+                prompt_tps = len(cancelled.prompt_tokens) / prompt_time if prompt_time > 0 else 0.0
+                generation_tps = state.tokens_generated / generation_time if generation_time > 0 else 0.0
+                
+                # Emit final chunk with stats (only on rank 0)
+                if device_rank == 0:
+                    event_sender.send(
+                        ChunkGenerated(
+                            command_id=cancel_cmd_id,
+                            chunk=TokenChunk(
+                                model=model_id,
+                                text="",
+                                token_id=-1,
+                                usage=Usage(
+                                    prompt_tokens=len(cancelled.prompt_tokens),
+                                    completion_tokens=state.tokens_generated,
+                                    total_tokens=len(cancelled.prompt_tokens) + state.tokens_generated,
+                                    prompt_tokens_details=PromptTokensDetails(),
+                                    completion_tokens_details=CompletionTokensDetails(),
+                                ),
+                                finish_reason="stop",
+                                stats=GenerationStats(
+                                    prompt_tps=prompt_tps,
+                                    generation_tps=generation_tps,
+                                    prompt_tokens=len(cancelled.prompt_tokens),
+                                    generation_tokens=state.tokens_generated,
+                                    peak_memory_usage=Memory.from_bytes(mx.get_peak_memory()),
+                                ),
+                            ),
+                        )
+                    )
+                
+                # Mark task as complete
+                event_sender.send(
+                    TaskStatusUpdated(task_id=cancelled.task_id, task_status=TaskStatus.Complete)
+                )
+        elif isinstance(new_task, TextGeneration):
+            # New generation request - add to batch (if not duplicate)
+            result = insert_batch_request(
+                batch_state=batch_state,
+                task_id=new_task.task_id,
+                command_id=new_task.command_id,
+                task_params=new_task.task_params,
+                tokenizer=tokenizer,
+                model_id=model_id,
+            )
+            if result is not None:
+                # Only acknowledge if actually inserted
+                event_sender.send(TaskAcknowledged(task_id=new_task.task_id))
+        else:
+            logger.warning(f"Unexpected task type in batch mode: {type(new_task)}")
+
+
+def _process_batch_token(
+    event: BatchTokenEvent,
+    batch_state: BatchState,
+    event_sender: MpSender[Event],
+    model_id: str,
+    device_rank: int,
+) -> None:
+    """Process a single token event from batch generation."""
+    request = event.request
+    state = request.state
+    
+    is_first = state.tokens_generated == 0
+    
+    # Track first token time for TPS calculation
+    if is_first and state.first_token_time == 0.0:
+        state.first_token_time = time.perf_counter()
+    
+    # Use the unified token processor
+    result = state.token_processor.process(event.token_id, event.token_text, is_first)
+    
+    # Handle tool call (only emit on rank 0)
+    if result.tool_call:
+        if device_rank == 0:
+            _emit_tool_call(event_sender, request.command_id, result.tool_call)
+        return
+    
+    # Skip if no text to emit
+    if result.text is None:
+        return
+    
+    token_text = result.text
+    
+    # Accumulate text for stop sequence detection
+    state.output_text += token_text
+    state.tokens_generated += 1
+    
+    # Check stop sequences
+    text_to_emit, stopped = check_stop_sequence(state.output_text, token_text, state.stop_sequences)
+    
+    # Emit token chunk (only on rank 0)
+    if text_to_emit and device_rank == 0:
+        event_sender.send(
+            ChunkGenerated(
+                command_id=request.command_id,
+                chunk=TokenChunk(
+                    model=model_id,
+                    text=text_to_emit,
+                    token_id=event.token_id,
+                    usage=None,  # Only include usage on final chunk
+                ),
+            )
+        )
+    
+    # Emit traces periodically
+    _send_traces_if_enabled(event_sender, request.task_id, device_rank)
+    
+    # Handle completion
+    if stopped or event.finish_reason:
+        # Check for any pending output from processor
+        final_result = state.token_processor.finish()
+        if final_result and final_result.text and device_rank == 0:
+            state.output_text += final_result.text
+            event_sender.send(
+                ChunkGenerated(
+                    command_id=request.command_id,
+                    chunk=TokenChunk(
+                        model=model_id,
+                        text=final_result.text,
+                        token_id=-1,
+                        usage=None,
+                    ),
+                )
+            )
+        
+        finish_reason = "stop" if stopped else (event.finish_reason or "length")
+        finish_batch_request(batch_state, request, was_stopped_early=stopped)
+        
+        # Calculate timing stats
+        now = time.perf_counter()
+        prompt_time = state.first_token_time - state.generation_start_time if state.first_token_time > 0 else 0.001
+        generation_time = now - state.first_token_time if state.first_token_time > 0 else 0.001
+        
+        prompt_tps = len(request.prompt_tokens) / prompt_time if prompt_time > 0 else 0.0
+        generation_tps = state.tokens_generated / generation_time if generation_time > 0 else 0.0
+        
+        # Log generation stats (similar to mlx_generate)
+        logger.info(
+            f"[batch:{request.uid}] Generation complete: "
+            f"prefill {len(request.prompt_tokens)} tokens @ {prompt_tps:.1f} tok/s, "
+            f"generated {state.tokens_generated} tokens @ {generation_tps:.1f} tok/s, "
+            f"finish_reason={finish_reason}"
+        )
+        
+        # Emit final chunk with stats and finish_reason (only on rank 0)
+        if device_rank == 0:
+            event_sender.send(
+                ChunkGenerated(
+                    command_id=request.command_id,
+                    chunk=TokenChunk(
+                        model=model_id,
+                        text="",  # Empty text for final chunk
+                        token_id=-1,
+                        usage=Usage(
+                            prompt_tokens=len(request.prompt_tokens),
+                            completion_tokens=state.tokens_generated,
+                            total_tokens=len(request.prompt_tokens) + state.tokens_generated,
+                            prompt_tokens_details=PromptTokensDetails(),
+                            completion_tokens_details=CompletionTokensDetails(),
+                        ),
+                        finish_reason=finish_reason,
+                        stats=GenerationStats(
+                            prompt_tps=prompt_tps,
+                            generation_tps=generation_tps,
+                            prompt_tokens=len(request.prompt_tokens),
+                            generation_tokens=state.tokens_generated,
+                            peak_memory_usage=Memory.from_bytes(mx.get_peak_memory()),
+                        ),
+                    ),
+                )
+            )
+        
+        # Mark task as complete
+        event_sender.send(
+            TaskStatusUpdated(task_id=request.task_id, task_status=TaskStatus.Complete)
+        )
+
+
+def _emit_tool_call(
+    event_sender: MpSender[Event],
+    command_id: CommandId,
+    tool_call: Any,
+) -> None:
+    """Emit a tool call chunk from GPT-OSS processing."""
+    event_sender.send(
+        ChunkGenerated(
+            command_id=command_id,
+            chunk=ToolCallChunk(
+                id=tool_call.id,
+                type=tool_call.type,
+                function={"name": tool_call.function.name, "arguments": tool_call.function.arguments},
+            ),
+        )
+    )
+
