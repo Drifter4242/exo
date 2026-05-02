@@ -1,4 +1,5 @@
 import itertools
+import os
 import time
 from collections import deque
 from collections.abc import Generator, Iterator
@@ -70,7 +71,15 @@ EXO_RUNNER_MUST_TIMEOUT = "EXO RUNNER MUST TIMEOUT"
 
 
 def _check_for_debug_prompts(task_params: TextGenerationTaskParams) -> None:
-    """Check for debug prompt triggers in the input."""
+    """Check for debug prompt triggers in the input.
+
+    Only active when EXO_DEBUG_TRIGGERS is set to any non-empty value in the environment.
+    Disabled by default to prevent production crashes from conversation
+    content that happens to contain trigger strings.
+    """
+    if not os.environ.get("EXO_DEBUG_TRIGGERS"):
+        return
+
     from exo.worker.engines.mlx.utils_mlx import mlx_force_oom
 
     if len(task_params.input) == 0:
@@ -138,8 +147,10 @@ class SequentialGenerator(Engine):
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
-        self._queue.extend(task for task in self._maybe_queue if task in agreed)
-        self._maybe_queue = [task for task in self._maybe_queue if task in different]
+        # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
+        # rank enqueues tasks in the same order, preventing TP collective deadlocks.
+        self._queue.extend(agreed)
+        self._maybe_queue = list(different)
 
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
@@ -291,6 +302,8 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
@@ -368,8 +381,10 @@ class BatchGenerator(Engine):
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
-        self._queue.extend(task for task in self._maybe_queue if task in agreed)
-        self._maybe_queue = [task for task in self._maybe_queue if task in different]
+        # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
+        # rank enqueues tasks in the same order, preventing TP collective deadlocks.
+        self._queue.extend(agreed)
+        self._maybe_queue = list(different)
 
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
@@ -539,6 +554,8 @@ class BatchGenerator(Engine):
 
     def close(self) -> None:
         self._gen.close()
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

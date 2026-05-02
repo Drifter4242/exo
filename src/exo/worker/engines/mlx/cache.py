@@ -1,6 +1,11 @@
+import concurrent.futures
 import gc
+import hashlib
+import json
 import os
+import time
 from copy import deepcopy
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -67,6 +72,62 @@ def _detached_copy(a: mx.array) -> mx.array:
     if dtype == mx.bfloat16:
         return mx.array(np.array(a.astype(mx.float32))).astype(mx.bfloat16)
     return mx.array(np.array(a))
+
+
+def copy_cache_shallow(cache: KVCacheType) -> KVCacheType:
+    """Fast cache copy: new wrapper objects with lazy slices of the underlying arrays.
+
+    For each KVCache layer, nc.keys = c.keys[..., :offset, :] creates a NEW Python
+    object (not an alias). MLX slice indexing does not share the Python identity of
+    the original, so __setitem__ on the copy never mutates the stored cache entry.
+    The slice is lazy — no data is copied until the first decode step writes new
+    tokens, at which point update_and_fetch allocates a fresh buffer via concatenate.
+    Because only the used portion (offset tokens) is eventually copied rather than
+    the full padded buffer, this is ~100x faster than deepcopy for large caches.
+    """
+    new_cache: list[
+        KVCache | RotatingKVCache | QuantizedKVCache | ArraysCache | CacheList
+    ] = []
+    for c in cache:
+        if isinstance(c, KVCache):
+            nc = KVCache.__new__(KVCache)
+            # Slice creates a new Python object; __setitem__ on nc.keys cannot
+            # reach stored.keys. Lazy: no data copy until first decode write.
+            nc.keys = c.keys[..., : c.offset, :] if c.keys is not None else None
+            nc.values = c.values[..., : c.offset, :] if c.values is not None else None
+            nc.offset = c.offset
+            new_cache.append(nc)
+        elif isinstance(c, RotatingKVCache):
+            nc = RotatingKVCache.__new__(RotatingKVCache)
+            nc.keys = c.keys
+            nc.values = c.values
+            nc.offset = c.offset
+            nc._idx = c._idx
+            nc.max_size = c.max_size
+            nc.keep = c.keep
+            new_cache.append(nc)
+        elif isinstance(c, QuantizedKVCache):
+            nc = QuantizedKVCache.__new__(QuantizedKVCache)
+            nc.keys = c.keys
+            nc.values = c.values
+            nc.offset = c.offset
+            nc.group_size = c.group_size
+            nc.bits = c.bits
+            new_cache.append(nc)
+        elif isinstance(c, ArraysCache):
+            nc = ArraysCache.__new__(ArraysCache)
+            nc.cache = list(c.cache)
+            nc.left_padding = c.left_padding
+            nc.lengths = c.lengths
+            new_cache.append(nc)
+        elif isinstance(c, CacheList):
+            nc = CacheList.__new__(CacheList)
+            nc.caches = tuple(copy_cache_shallow(list(c.caches)))
+            new_cache.append(nc)
+        else:
+            # Fallback: unknown cache type — keep reference (may need deepcopy)
+            new_cache.append(c)
+    return new_cache
 
 
 def copy_rotating_kv_cache(cache: RotatingKVCache) -> RotatingKVCache | None:
@@ -229,8 +290,198 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+# ---------------------------------------------------------------------------
+# Context-shift helpers: rotate cached k_pe by -delta positions so a cache
+# built at absolute positions [0..N-1] can be reused at positions [0..N-delta-1]
+# after the front delta tokens are dropped from the context window.
+# ---------------------------------------------------------------------------
+
+
+def _apply_reverse_rope(
+    x: mx.array,
+    cos_d: mx.array,
+    sin_d: mx.array,
+    traditional: bool,
+) -> mx.array:
+    """Apply R(-delta) to every token in x.
+
+    For traditional=True (GPT-J / DeepSeekV3 interleaved pairs):
+        R^-1 pairs:  new[2i]   =  x[2i]*cos + x[2i+1]*sin
+                     new[2i+1] = -x[2i]*sin + x[2i+1]*cos
+
+    For traditional=False (GPT-NeoX split-half):
+        new_left  = x_left*cos + x_right*sin
+        new_right = -x_left*sin + x_right*cos
+
+    cos_d / sin_d have shape (D//2,) — the per-frequency values for delta.
+    """
+    if traditional:
+        x_even = x[..., 0::2]  # (..., N, D//2)
+        x_odd = x[..., 1::2]
+        new_even = x_even * cos_d + x_odd * sin_d
+        new_odd = -x_even * sin_d + x_odd * cos_d
+        # Interleave back: stack on last axis then flatten
+        stacked = mx.stack([new_even, new_odd], axis=-1)  # (..., N, D//2, 2)
+        return stacked.reshape(*x.shape[:-1], x.shape[-1])
+    else:
+        d2 = x.shape[-1] // 2
+        x_left = x[..., :d2]
+        x_right = x[..., d2:]
+        new_left = x_left * cos_d + x_right * sin_d
+        new_right = -x_left * sin_d + x_right * cos_d
+        return mx.concatenate([new_left, new_right], axis=-1)
+
+
+def _get_rope_config(model: "Model") -> tuple[mx.array, bool] | None:
+    """Extract (rope_freqs, traditional) from the first attention layer.
+
+    Walks model → language_model → model → layers[i].self_attn.rope
+    and returns the first rope module that has a ``_freqs`` attribute.
+    Returns None if no suitable rope is found.
+    """
+    candidate = model
+    for attr in ("language_model", "model"):
+        sub = getattr(candidate, attr, None)
+        if sub is not None:
+            candidate = sub
+    layers = getattr(candidate, "layers", None) or []
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None) or getattr(layer, "attn", None)
+        if attn is None:
+            continue
+        rope = getattr(attn, "rope", None)
+        if rope is None:
+            continue
+        freqs = getattr(rope, "_freqs", None)
+        if freqs is not None:
+            traditional = bool(getattr(rope, "traditional", True))
+            return freqs, traditional
+    return None
+
+
+def shift_kv_cache(
+    cache: KVCacheType,
+    delta: int,
+    rope_freqs: mx.array,
+    traditional: bool,
+) -> None:
+    """Shift the logical start of every KVCache entry forward by *delta* tokens.
+
+    After this call each KVCache holds tokens that were previously at absolute
+    positions [delta .. offset-1]; they are now presented as positions
+    [0 .. offset-delta-1].  The position-encoded component is re-rotated by
+    R(-delta) so that attention scores remain correct.
+
+    Cache-type semantics
+    --------------------
+    MLA models (DeepSeekV3 / Kimi): keys = kv_latent (no RoPE, dim 512),
+        values = k_pe (RoPE baked in at absolute pos, dim 64).
+        → only values need rotation; keys are sliced as-is.
+
+    Standard models (LLaMA, Qwen …): keys = R(pos)*K (head_dim),
+        values = V (no RoPE, head_dim).
+        → only keys need rotation; values are sliced as-is.
+
+    Detection: MLA when keys_dim > values_dim.
+
+    Non-KVCache entries (RotatingKVCache, ArraysCache) are left untouched
+    because they handle positions differently (sliding window / SSM state).
+    """
+    cos_d = mx.cos(delta * rope_freqs)  # (rope_dims//2,)
+    sin_d = mx.sin(delta * rope_freqs)
+
+    for c in cache:
+        if not isinstance(c, KVCache):
+            continue
+        if c.keys is None or c.values is None:
+            continue
+        n = c.offset
+        if n <= delta:
+            # Nothing useful remains after shift — leave cache valid but empty.
+            c.offset = 0
+            continue
+
+        k = c.keys  # physical buffer, may be larger than [0:n]
+        v = c.values
+        dim_k = k.shape[-1]
+        dim_v = v.shape[-1]
+        is_mla = dim_k > dim_v
+
+        if is_mla:
+            # keys = kv_latent: position-free, slice only
+            c.keys = k[:, :, delta:n, :]
+            # values = k_pe: rotate to compensate for position shift
+            c.values = _apply_reverse_rope(
+                v[:, :, delta:n, :], cos_d, sin_d, traditional
+            )
+        else:
+            # keys = K with RoPE: rotate
+            c.keys = _apply_reverse_rope(k[:, :, delta:n, :], cos_d, sin_d, traditional)
+            # values = V: no position encoding, slice only
+            c.values = v[:, :, delta:n, :]
+
+        c.offset = n - delta
+
+    # Force evaluation so the sliced arrays are materialised before generation
+    # starts; otherwise the compute graph may hold references to the full buffers.
+    to_eval = []
+    for c in cache:
+        if isinstance(c, KVCache) and c.keys is not None:
+            to_eval.extend([c.keys, c.values])
+    if to_eval:
+        mx.eval(*to_eval)
+
+
+def _find_suffix_shift(
+    prompt_tokens: mx.array,
+    cached_tokens: mx.array,
+    min_match: int = 64,
+) -> tuple[int, int]:
+    """Find the smallest delta such that cached_tokens[delta:] is a prefix of prompt_tokens.
+
+    Returns (delta, match_length) where match_length is the number of tokens
+    from the cache that are reusable.  Returns (0, 0) if no match is found.
+
+    Uses a two-point fingerprint to guard against pathological repetitive prefixes
+    (e.g. all-spaces tokens): requires both pt[:min_match] and pt[min_match:2*min_match]
+    to match before doing the full overlap check.  Falls back to single-point if the
+    prompt is shorter than 2*min_match.  min_match controls the minimum overlap
+    required to accept a match.
+    """
+    pt = np.asarray(prompt_tokens)
+    ct = np.asarray(cached_tokens)
+
+    n_cached = len(ct)
+    n_prompt = len(pt)
+
+    if n_cached == 0 or n_prompt < min_match:
+        return 0, 0
+
+    key1 = pt[:min_match]
+    # Second fingerprint from offset min_match; absent when prompt is short.
+    use_two_keys = n_prompt >= 2 * min_match
+    key2 = pt[min_match : 2 * min_match] if use_two_keys else None
+
+    limit = n_cached - min_match
+
+    for delta in range(1, limit + 1):
+        if not np.array_equal(ct[delta : delta + min_match], key1):
+            continue
+        # First fingerprint matched — check second to filter repetitive sequences.
+        if use_two_keys and not np.array_equal(
+            ct[delta + min_match : delta + 2 * min_match], key2
+        ):
+            continue
+        # Both fingerprints match — measure full overlap.
+        overlap = min(n_cached - delta, n_prompt)
+        if np.array_equal(ct[delta : delta + overlap], pt[:overlap]):
+            return delta, overlap
+
+    return 0, 0
+
+
 class KVPrefixCache:
-    def __init__(self, group: mx.distributed.Group | None):
+    def __init__(self, group: mx.distributed.Group | None, model_id: str = ""):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -239,6 +490,16 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        self._model_id = model_id
+        self._rank = 0 if group is None else group.rank()
+        self._save_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._disk_dir: Path | None = self._init_disk_dir()
+        logger.info("KV prefix cache initialized (fresh start — all entries cleared)")
+        if self._disk_dir is not None:
+            self._save_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kv_disk_save"
+            )
+            self._load_from_disk()
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -248,6 +509,177 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    # ------------------------------------------------------------------
+    # Disk-cache helpers
+    # ------------------------------------------------------------------
+
+    def _init_disk_dir(self) -> Path | None:
+        """Called once at construction — creates and caches the disk cache directory."""
+        d = os.environ.get("EXO_DISK_CACHE_DIR")
+        if not d:
+            return None
+        p = Path(d).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _get_disk_dir(self) -> Path | None:
+        return self._disk_dir
+
+    def _entry_path(self, tokens: mx.array) -> Path:
+        h = hashlib.sha256(np.asarray(tokens).tobytes()).hexdigest()[:16]
+        return self._get_disk_dir() / f"{h}_r{self._rank}.safetensors"  # type: ignore[operator]
+
+    def _save_entry_async(self, index: int) -> None:
+        """Build + evaluate arrays on the main thread, then write to disk in background."""
+        if self._save_executor is None:
+            return
+        tokens = self.prompts[index]
+        cache = self.caches[index]
+        prefill_tps = self.prefill_tps[index]
+
+        if has_non_kv_caches(cache):
+            return
+
+        cdir = self._get_disk_dir()
+        if cdir is None:
+            return
+
+        # Build arrays dict here (main thread) so we can eval on the GPU stream
+        arrays: dict[str, mx.array] = {}
+        offsets: dict[str, int] = {}
+        for i, c in enumerate(cache):
+            if not isinstance(c, KVCache) or c.keys is None:
+                continue
+            n = c.offset
+            arrays[f"layer_{i}_k"] = c.keys[..., :n, :]
+            arrays[f"layer_{i}_v"] = c.values[..., :n, :]
+            offsets[str(i)] = n
+        if not arrays:
+            return
+        arrays["tokens"] = tokens
+
+        # Evaluate on main thread — background thread has no GPU stream
+        mx.eval(*list(arrays.values()))
+
+        meta = {
+            "model_id": self._model_id,
+            "rank": str(self._rank),
+            "offsets": json.dumps(offsets),
+            "prefill_tps": str(prefill_tps),
+            "saved_at": str(time.time()),
+            "n_layers": str(len(cache)),
+        }
+        path = self._entry_path(tokens)
+        self._save_executor.submit(self._write_to_disk, arrays, meta, path)
+
+    def _write_to_disk(
+        self, arrays: dict[str, mx.array], meta: dict[str, str], path: "Path"
+    ) -> None:
+        """Write already-evaluated arrays to disk (background thread)."""
+        try:
+            t0 = time.monotonic()
+            mx.save_safetensors(str(path), arrays, metadata=meta)
+            dt = time.monotonic() - t0
+            sz_gb = path.stat().st_size / 1e9
+            n_tokens = len(arrays["tokens"])
+            logger.info(
+                f"KV disk cache saved: {n_tokens} tokens → {path.name} "
+                f"({sz_gb:.3f} GB in {dt:.2f}s)"
+            )
+            self._evict_disk_if_needed()
+        except Exception:
+            logger.exception("KV disk cache: write failed")
+
+    def _load_from_disk(self) -> None:
+        """Load all matching saved cache entries from disk on startup."""
+        cdir = self._get_disk_dir()
+        if cdir is None:
+            return
+        files = sorted(cdir.glob(f"*_r{self._rank}.safetensors"))
+        if not files:
+            logger.info(f"KV disk cache: no saved entries found (dir={cdir})")
+            return
+        loaded = 0
+        skipped = 0
+        for path in files:
+            try:
+                arrays, meta = mx.load(str(path), return_metadata=True)
+                if meta.get("model_id", "") != self._model_id:
+                    logger.info(
+                        f"KV disk cache: skipping {path.name} "
+                        f"(model_id {meta.get('model_id')!r} != {self._model_id!r})"
+                    )
+                    skipped += 1
+                    continue
+                n_layers = int(meta["n_layers"])
+                prefill_tps = float(meta.get("prefill_tps", 0.0))
+                tokens = arrays["tokens"]
+
+                rebuilt: list[KVCache] = []
+                for i in range(n_layers):
+                    k_key = f"layer_{i}_k"
+                    v_key = f"layer_{i}_v"
+                    if k_key not in arrays:
+                        rebuilt.append(
+                            KVCache()
+                        )  # empty placeholder for skipped layers
+                        continue
+                    c = KVCache()
+                    c.state = (arrays[k_key], arrays[v_key])
+                    rebuilt.append(c)
+
+                # Trigger eval so tensors are resident before first use
+                to_eval = [c.keys for c in rebuilt if c.keys is not None] + [
+                    c.values for c in rebuilt if c.values is not None
+                ]
+                if to_eval:
+                    mx.eval(*to_eval)
+
+                self.prompts.append(tokens)
+                self.caches.append(rebuilt)  # type: ignore[arg-type]
+                self._snapshots.append(None)
+                self._media_regions.append([])
+                self.prefill_tps.append(prefill_tps)
+                self._access_counter += 1
+                self._last_used.append(self._access_counter)
+                loaded += 1
+            except Exception:
+                logger.exception(f"KV disk cache: failed to load {path.name}, skipping")
+                skipped += 1
+        logger.info(
+            f"KV disk cache: loaded {loaded} entries, skipped {skipped} (dir={cdir})"
+        )
+
+    def _evict_disk_if_needed(self) -> None:
+        """Remove oldest disk cache files if total size exceeds EXO_DISK_CACHE_GB."""
+        cdir = self._get_disk_dir()
+        if cdir is None:
+            return
+        max_bytes = float(os.environ.get("EXO_DISK_CACHE_GB", "50")) * 1e9
+        files = sorted(
+            cdir.glob(f"*_r{self._rank}.safetensors"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        total = sum(p.stat().st_size for p in files)
+        while total > max_bytes and files:
+            oldest = files.pop(0)
+            sz = oldest.stat().st_size
+            total -= sz
+            oldest.unlink(missing_ok=True)
+            logger.info(
+                f"KV disk cache evicted (size limit): {oldest.name} ({sz / 1e9:.3f} GB)"
+            )
+
+    def close(self) -> None:
+        """Shut down the background save executor gracefully."""
+        if self._save_executor is not None:
+            self._save_executor.shutdown(wait=True)
+            self._save_executor = None
+
+    # ------------------------------------------------------------------
+    # End disk-cache helpers
+    # ------------------------------------------------------------------
 
     def add_kv_cache(
         self,
@@ -267,6 +699,7 @@ class KVPrefixCache:
         self._access_counter += 1
         self._last_used.append(self._access_counter)
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
+        self._save_entry_async(len(self.caches) - 1)
 
     def update_kv_cache(
         self,
@@ -294,6 +727,7 @@ class KVPrefixCache:
         self._access_counter += 1
         self._last_used[index] = self._access_counter
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
+        self._save_entry_async(index)
 
     def _get_snapshot(
         self, entry_index: int, target_token_count: int
@@ -358,6 +792,37 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            # ---------------------------------------------------------------
+            # Suffix-alignment fallback: the new prompt may be a suffix of a
+            # cached prompt (e.g. Copilot dropped the oldest message so the
+            # shared context starts delta tokens into the cached sequence).
+            # If we find such a shift we can reuse the cache after applying
+            # R(-delta) to the RoPE-encoded component.
+            # Only attempt this for pure-KVCache entries (no SSM / sliding window).
+            # ---------------------------------------------------------------
+            rope_cfg = _get_rope_config(model)
+            if rope_cfg is not None:
+                for i, cached_prompt in enumerate(self.prompts):
+                    if has_non_kv_caches(self.caches[i]):
+                        continue
+                    delta, match_len = _find_suffix_shift(prompt_tokens, cached_prompt)
+                    if match_len < 1:
+                        continue
+                    logger.info(
+                        f"KV cache suffix shift: delta={delta}, reusing {match_len} tokens "
+                        f"(saves {match_len} prefill tokens)"
+                    )
+                    _t0 = time.monotonic()
+                    prompt_cache = copy_cache_shallow(self.caches[i])
+                    logger.debug(
+                        f"copy_cache_shallow: {(time.monotonic() - _t0) * 1000:.2f}ms"
+                    )
+                    shift_kv_cache(prompt_cache, delta, *rope_cfg)
+                    self._access_counter += 1
+                    self._last_used[i] = self._access_counter
+                    remaining = prompt_tokens[match_len:]
+                    return prompt_cache, remaining, i, False
+
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -376,7 +841,13 @@ class KVPrefixCache:
         if restore_snap is None and has_ssm:
             return make_kv_cache(model), prompt_tokens, None, False
 
-        prompt_cache = deepcopy(self.caches[best_index])
+        # Use shallow copy for fast cache duplication. MLX arrays use
+        # copy-on-write, so the first write during generation will trigger
+        # a lazy copy of only affected pages rather than copying the entire
+        # cache upfront. This reduces cache-hit TTFT from ~200ms to <10ms.
+        _t0 = time.monotonic()
+        prompt_cache = copy_cache_shallow(self.caches[best_index])
+        logger.debug(f"copy_cache_shallow: {(time.monotonic() - _t0) * 1000:.2f}ms")
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
