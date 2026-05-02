@@ -8,6 +8,7 @@ family = "kimi"
 quantization = ""
 base_model = "Kimi K2.6"
 capabilities = ["text", "thinking", "thinking_toggle", "vision"]
+reasoning_dialect = "suffix"
 
 context_length = 262144
 
@@ -18,7 +19,7 @@ in_bytes = 595148192736
 image_token_id = 163605
 model_type = "kimi_vl"
 weights_repo = "exolabs/Kimi-K2.6-vision"
-processor_repo = "moonshotai/Kimi-K2.6"
+processor_repo = "exolabs/Kimi-K2.6-vision"
 
 # Source: https://huggingface.co/moonshotai/Kimi-K2.6
 [sampling_defaults]
@@ -26,7 +27,6 @@ temperature = 1.0
 top_p = 0.95
 min_p = 0.01
 
-# Source: https://huggingface.co/moonshotai/Kimi-K2.6
 [sampling_defaults.non_thinking]
 temperature = 0.6
 top_p = 0.95

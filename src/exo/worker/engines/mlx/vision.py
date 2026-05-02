@@ -309,8 +309,17 @@ class VisionEncoder:
                     break
 
         if projector_cls is not None:
+            text_config_dict = dict(config.get("text_config", {}))  # type: ignore
+            if not text_config_dict:
+                # Some vision repos (e.g. exolabs/Kimi-K2.6-vision) embed
+                # text_hidden_size inside vision_config instead of a top-level
+                # text_config block.  Fall back to that so the projector output
+                # dim is correct.
+                text_hidden_size = vision_cfg.get("text_hidden_size")  # type: ignore
+                if text_hidden_size:
+                    text_config_dict = {"hidden_size": int(text_hidden_size)}
             text_config = config_mod.TextConfig(  # type: ignore
-                **_filter_config(config_mod.TextConfig, config.get("text_config", {}))  # type: ignore
+                **_filter_config(config_mod.TextConfig, text_config_dict)  # type: ignore
             )
             extra = {
                 k: v
@@ -342,7 +351,11 @@ class VisionEncoder:
             repo = str(self._model_path)
         try:
             image_proc = load_image_processor(repo)
-        except ValueError:
+        except (ValueError, KeyError):
+            # KeyError: vision-only repos (e.g. exolabs/Kimi-K2.6-vision) have
+            # a custom config.json without 'model_type', causing mlx_vlm's
+            # load_image_processor to throw KeyError.  Fall through to the
+            # module-based loader below.
             image_proc = None
         if image_proc is None:
             image_proc = self._load_image_processor_from_module(repo)
@@ -355,6 +368,29 @@ class VisionEncoder:
         if processor_repo:
             self._merge_kernel_size = vision_cfg.get("merge_kernel_size", [2, 2])  # type: ignore
             self._needs_nhwc = True
+            # The fallback processor (e.g. KimiVLImageProcessor from mlx_vlm)
+            # may have hardcoded normalization constants designed for a
+            # different model version.  Override mean/std from the repo's own
+            # preprocessor_config.json if it supplies them via media_proc_cfg.
+            proc_cfg_path = self._model_path / "preprocessor_config.json"
+            if proc_cfg_path.exists() and self._processor is not None:
+                try:
+                    with open(proc_cfg_path) as _f:
+                        _proc_cfg = json.load(_f)
+                    _media = _proc_cfg.get("media_proc_cfg", {})
+                    _mean = _media.get("image_mean")
+                    _std = _media.get("image_std")
+                    if _mean and _std and hasattr(self._processor, "image_mean"):
+                        self._processor.image_mean = tuple(float(x) for x in _mean)
+                        self._processor.image_std = tuple(float(x) for x in _std)
+                        logger.info(
+                            f"Overrode processor normalization from preprocessor_config: "
+                            f"mean={_mean}, std={_std}"
+                        )
+                except Exception as _e:
+                    logger.warning(
+                        f"Failed to read preprocessor_config normalization: {_e}"
+                    )
         logger.info(f"HF image processor loaded from {repo}")
 
     def _load_weights_from_separate_repo(self) -> None:
