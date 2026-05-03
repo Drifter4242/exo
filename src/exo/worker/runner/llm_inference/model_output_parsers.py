@@ -5,6 +5,7 @@ from typing import Any
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
+from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from openai_harmony import (  # pyright: ignore[reportMissingTypeStubs]
     HarmonyEncodingName,
@@ -96,6 +97,22 @@ def apply_all_parsers(
                 starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
             )
         generator = parse_deepseek_v4(generator)
+    elif issubclass(model_type, KimiK25Model):
+        # Kimi K2 family: uses a short <think> special token for primary reasoning
+        # but also emits visible <thinking>...</thinking> blocks as regular BPE text
+        # for secondary reasoning sections.  Both passes are required.
+        if tokenizer.has_thinking:
+            generator = parse_thinking_models(
+                generator,
+                tokenizer.think_start,
+                tokenizer.think_end,
+                starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
+            )
+            generator = parse_secondary_thinking_tags(
+                generator, "<thinking>", "</thinking>"
+            )
+        if tool_parser:
+            generator = parse_tool_calls(generator, tool_parser, tools)
     else:
         if tokenizer.has_thinking:
             generator = parse_thinking_models(
@@ -409,6 +426,95 @@ def parse_thinking_models(
 
         accumulated = ""
 
+        yield from drain_pending(is_thinking)
+        yield response.model_copy(update={"is_thinking": is_thinking})
+
+
+def parse_secondary_thinking_tags(
+    responses: Generator[GenerationResponse | None],
+    think_start: str,
+    think_end: str,
+) -> Generator[GenerationResponse | None]:
+    """Strip secondary visible think-tag text from content and route to reasoning.
+
+    Handles models (e.g. Kimi K2) that use a short special token (<think>) for
+    internal reasoning but ALSO emit visible <thinking>...</thinking> blocks as
+    regular BPE text in their output.  This pass runs AFTER parse_thinking_models
+    so it can safely pass through tokens already marked is_thinking=True.
+    """
+    is_thinking = False
+    accumulated = ""
+    pending_buffer: list[GenerationResponse] = []
+
+    def drain_pending(_is_thinking: bool):
+        for buffered in pending_buffer:
+            yield buffered.model_copy(update={"is_thinking": _is_thinking})
+        pending_buffer.clear()
+
+    for response in responses:
+        if response is None:
+            yield None
+            continue
+
+        # Tokens already routed as thinking by the primary pass — pass through.
+        if response.is_thinking:
+            yield from drain_pending(is_thinking)
+            accumulated = ""
+            yield response
+            continue
+
+        accumulated += response.text
+
+        if response.finish_reason is not None:
+            yield from drain_pending(is_thinking)
+            yield response.model_copy(update={"is_thinking": False})
+            is_thinking = False
+            accumulated = ""
+            continue
+
+        if accumulated == think_start and not is_thinking:
+            is_thinking = True
+            accumulated = ""
+            pending_buffer.clear()
+            continue
+        if accumulated == think_end and is_thinking:
+            is_thinking = False
+            accumulated = ""
+            pending_buffer.clear()
+            continue
+
+        # Single token that contains the full tag plus extra chars.
+        if (
+            not is_thinking
+            and len(accumulated) > len(think_start)
+            and accumulated.startswith(think_start)
+        ):
+            remainder = accumulated[len(think_start) :]
+            is_thinking = True
+            accumulated = ""
+            pending_buffer.clear()
+            yield response.model_copy(update={"text": remainder, "is_thinking": True})
+            continue
+        if (
+            is_thinking
+            and len(accumulated) > len(think_end)
+            and accumulated.startswith(think_end)
+        ):
+            remainder = accumulated[len(think_end) :]
+            is_thinking = False
+            accumulated = ""
+            pending_buffer.clear()
+            yield response.model_copy(update={"text": remainder, "is_thinking": False})
+            continue
+
+        # Prefix match — hold in pending buffer until we know if it's a full tag.
+        if (not is_thinking and accumulated == think_start[: len(accumulated)]) or (
+            is_thinking and accumulated == think_end[: len(accumulated)]
+        ):
+            pending_buffer.append(response)
+            continue
+
+        accumulated = ""
         yield from drain_pending(is_thinking)
         yield response.model_copy(update={"is_thinking": is_thinking})
 

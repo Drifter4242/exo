@@ -39,6 +39,10 @@ from exo.shared.types.text_generation import (
 )
 
 
+_THINK_TAG_RE = re.compile(r"<(thinking|think)>(.*?)</\1>", re.DOTALL)
+_split_re = re.compile(r"^(thinking|think)>\s*")
+
+
 def extract_base64_from_data_url(data_url: str) -> Base64Image:
     match = re.match(r"data:[^;]+;base64,(.+)", data_url)
     if match:
@@ -357,6 +361,34 @@ async def collect_chat_response(
 
     combined_text = "".join(text_parts)
     combined_thinking = "".join(thinking_parts) if thinking_parts else None
+
+    # Strip any residual <thinking>…</thinking> or <think>…</think> blocks that
+    # leaked through the token-level state machine (e.g. when the model emits a
+    # second thinking block mid-generation).  Extracted content is appended to
+    # combined_thinking so it still reaches reasoning_content.
+    def _strip_think_tags(text: str) -> tuple[str, str | None]:
+        extra: list[str] = []
+
+        def _replace(m: re.Match) -> str:
+            extra.append(m.group(2))
+            return ""
+
+        cleaned = _THINK_TAG_RE.sub(_replace, text).lstrip("\n")
+        return cleaned, "".join(extra) if extra else None
+
+    combined_text, leaked = _strip_think_tags(combined_text)
+    if leaked:
+        combined_thinking = (combined_thinking or "") + leaked
+
+    # Handle split close-tag at the reasoning/content boundary:
+    # e.g. reasoning_content ends with "</" and content starts with "thinking>" or "think>"
+    if combined_thinking and combined_text:
+        if combined_thinking.endswith("</"):
+            m = _split_re.match(combined_text)
+            if m:
+                combined_thinking = combined_thinking[:-2]  # strip the dangling "</"
+                combined_text = combined_text[m.end() :]
+
     assert model is not None
 
     yield ChatCompletionResponse(
