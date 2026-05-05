@@ -516,25 +516,35 @@ def consolidate_system_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
-    System messages almost exclusively must go at the start of a message
-    and there must only be a single one.
+    Consolidate leading system/developer messages into a single system message
+    at the start. System messages that appear after the first user or assistant
+    turn are left in place — they are mid-conversation injections (e.g. from
+    SillyTavern image-gen plugins) and must stay positioned where the caller
+    placed them so the model sees them at the right point in context.
 
     Also, Codex sends "developer" messages which are just system prompts.
     """
-    system_parts: list[str] = []
-    non_system: list[dict[str, Any]] = []
-    for msg in messages:
+    # Collect leading system messages (before any user/assistant turn)
+    leading_parts: list[str] = []
+    split_idx = 0
+    for i, msg in enumerate(messages):
         if msg.get("role") in ("system", "developer"):
             content = cast(str, msg.get("content", ""))
             if content:
-                system_parts.append(content)
+                leading_parts.append(content)
+            split_idx = i + 1
         else:
-            non_system.append(msg)
-    formatted_messages = non_system
-    if system_parts:
-        formatted_messages.insert(
-            0, {"role": "system", "content": "\n".join(system_parts)}
+            # First non-system message — stop hoisting
+            break
+
+    rest = messages[split_idx:]
+
+    formatted_messages: list[dict[str, Any]] = []
+    if leading_parts:
+        formatted_messages.append(
+            {"role": "system", "content": "\n".join(leading_parts)}
         )
+    formatted_messages.extend(rest)
     return formatted_messages
 
 
