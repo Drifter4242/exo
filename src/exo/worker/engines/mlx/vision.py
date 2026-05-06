@@ -355,6 +355,37 @@ class VisionEncoder:
         if processor_repo:
             self._merge_kernel_size = vision_cfg.get("merge_kernel_size", [2, 2])  # type: ignore
             self._needs_nhwc = True
+            # The fallback processor (e.g. KimiVLImageProcessor from mlx_vlm)
+            # may have hardcoded normalization constants designed for a
+            # different model version.  Override mean/std from the repo's own
+            # preprocessor_config.json if it supplies them via media_proc_cfg.
+            proc_cfg_path = self._main_model_path / "preprocessor_config.json"
+            if proc_cfg_path.exists():
+                _proc = cast("ImageProcessor | None", self._processor)
+                if _proc is not None:
+                    try:
+                        with open(proc_cfg_path) as _f:
+                            _proc_cfg = cast(dict[str, Any], json.load(_f))
+                        _media = cast(
+                            dict[str, Any], _proc_cfg.get("media_proc_cfg", {})
+                        )
+                        _mean = cast(list[float] | None, _media.get("image_mean"))
+                        _std = cast(list[float] | None, _media.get("image_std"))
+                        if (
+                            _mean is not None
+                            and _std is not None
+                            and hasattr(_proc, "image_mean")
+                        ):
+                            setattr(_proc, "image_mean", tuple(float(x) for x in _mean))
+                            setattr(_proc, "image_std", tuple(float(x) for x in _std))
+                            logger.info(
+                                f"Overrode processor normalization from preprocessor_config: "
+                                f"mean={_mean}, std={_std}"
+                            )
+                    except Exception as _e:
+                        logger.warning(
+                            f"Failed to read preprocessor_config normalization: {_e}"
+                        )
         logger.info(f"HF image processor loaded from {repo}")
 
     def _load_weights_from_separate_repo(self) -> None:
