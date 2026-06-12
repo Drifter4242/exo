@@ -72,6 +72,27 @@ if TYPE_CHECKING:
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
 
 
+def _rss_gib() -> float:
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / 1024**3
+    except Exception:
+        import resource
+
+        # ru_maxrss is bytes on macOS (peak, not current)
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**3
+
+
+def log_mem_snapshot(tag: str) -> None:
+    logger.info(
+        f"mem [{tag}]: rss={_rss_gib():.1f}GiB "
+        f"active={mx.get_active_memory() / 1024**3:.1f}GiB "
+        f"cache={mx.get_cache_memory() / 1024**3:.1f}GiB "
+        f"peak={mx.get_peak_memory() / 1024**3:.1f}GiB"
+    )
+
+
 def flush_prefill_sends() -> None:
     for output, dst, group in _pending_prefill_sends:
         sent = mx.distributed.send(output, dst, group=group)
@@ -715,7 +736,12 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
             eh = sh + num_heads
 
             def shard_heads(w: mx.array, sh: int = sh, eh: int = eh) -> mx.array:
-                return w[sh:eh]
+                # mx.contiguous detaches the slice from the full weight so the
+                # unsharded array can be freed (see _shard_v4_attention_heads —
+                # a bare view keeps the full weight resident).
+                sliced = mx.contiguous(w[sh:eh])
+                mx.eval(sliced)
+                return sliced
 
             layer.self_attn.embed_q.apply(shard_heads)
             layer.self_attn.unembed_out.apply(shard_heads)
@@ -745,6 +771,16 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
                 layer.mlp.sharding_group = self.group
 
             mx.eval(layer)
+            mx.clear_cache()
+
+            if i % 4 == 0 or i >= total - 8:
+                logger.info(
+                    f"shard mem layer {i}/{total}: "
+                    f"rss={_rss_gib():.1f}GiB "
+                    f"active={mx.get_active_memory() / 1024**3:.1f}GiB "
+                    f"cache={mx.get_cache_memory() / 1024**3:.1f}GiB "
+                    f"peak={mx.get_peak_memory() / 1024**3:.1f}GiB"
+                )
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
 

@@ -203,6 +203,9 @@ def load_mlx_items(
         )
 
     mx.clear_cache()
+    from exo.worker.engines.mlx.auto_parallel import log_mem_snapshot
+
+    log_mem_snapshot("load_mlx_items done (post clear_cache)")
 
     vision_config = bound_instance.bound_shard.model_card.vision
 
@@ -275,13 +278,18 @@ def shard_and_load(
             )
 
     # TODO: Do we need this?
+    from exo.worker.engines.mlx.auto_parallel import log_mem_snapshot
+
+    log_mem_snapshot("before final mx.eval(model)")
     mx.eval(model)
+    log_mem_snapshot("after final mx.eval(model)")
 
     logger.debug("SHARDED")
     logger.debug(model)
 
     # Synchronize processes before generation to avoid timeout
     mx_barrier(group)
+    log_mem_snapshot("after mx_barrier")
 
     return model, tokenizer
 
