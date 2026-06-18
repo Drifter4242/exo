@@ -1,0 +1,21 @@
+model_id = "mlx-community/GLM-5.2-DQ4plus-q8"
+n_layers = 78
+hidden_size = 6144
+num_key_value_heads = 64
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "glm"
+quantization = "8bit"
+base_model = "GLM-5.2"
+capabilities = ["text", "thinking", "thinking_toggle"]
+reasoning_dialect = "post_last_user"
+context_length = 1048576
+
+[storage_size]
+in_bytes = 465000000000
+
+# Source: https://huggingface.co/mlx-community/GLM-5.2-DQ4plus-q8
+# Source: https://huggingface.co/zai-org/GLM-5.2-FP8
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
