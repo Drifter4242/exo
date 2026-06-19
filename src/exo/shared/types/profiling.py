@@ -56,6 +56,21 @@ class DiskUsage(FrozenModel):
         )
 
 
+class DiskShelf(FrozenModel):
+    """Disk usage for one configured models directory ("shelf") on a node.
+
+    A node may have several shelves: its writable model dirs (EXO_MODELS_DIRS)
+    plus any read-only dirs (EXO_MODELS_READ_ONLY_DIRS, e.g. a shared/remote
+    mount). Multiple configured dirs that resolve to the same physical
+    partition are reported once.
+    """
+
+    path: str
+    total: Memory
+    available: Memory
+    read_only: bool = False
+
+
 class SystemPerformanceProfile(FrozenModel):
     # TODO: flops_fp16: float
 
@@ -83,6 +98,9 @@ class NodeIdentity(FrozenModel):
     friendly_name: str = "Unknown"
     os_version: str = "Unknown"
     os_build_version: str = "Unknown"
+    # Whether this node is configured to stream tensor-parallel weights from the
+    # source node over JACCL (EXO_TP_STREAM_WEIGHTS). Load-time setting.
+    tp_stream_weights: bool = False
 
 
 class NodeNetworkInfo(FrozenModel):

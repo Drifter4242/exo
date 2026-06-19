@@ -48,7 +48,14 @@ from .api import PowerUsage as PowerUsage
 from .api import PromptTokensDetails as PromptTokensDetails
 from .api import StartDownloadParams as StartDownloadParams
 from .api import StartDownloadResponse as StartDownloadResponse
+from .api import StorageDisk as StorageDisk
+from .api import StorageDiskList as StorageDiskList
+from .api import StorageModel as StorageModel
+from .api import StorageModelList as StorageModelList
+from .api import StorageModelLocation as StorageModelLocation
 from .api import StreamingChoiceResponse as StreamingChoiceResponse
+from .api import StreamingNodeStatus as StreamingNodeStatus
+from .api import StreamingStatus as StreamingStatus
 from .api import ToolCall as ToolCall
 from .api import ToolCallItem as ToolCallItem
 from .api import TopLogprobItem as TopLogprobItem

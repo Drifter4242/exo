@@ -88,6 +88,13 @@ from exo.api.types import (
     PlacementPreviewResponse,
     StartDownloadParams,
     StartDownloadResponse,
+    StorageDisk,
+    StorageDiskList,
+    StorageModel,
+    StorageModelList,
+    StorageModelLocation,
+    StreamingNodeStatus,
+    StreamingStatus,
     ToolCall,
     TraceCategoryStats,
     TraceEventResponse,
@@ -350,6 +357,9 @@ class API:
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
         self.app.get("/models")(self.get_models)
         self.app.get("/v1/models")(self.get_models)
+        self.app.get("/v1/storage/disks")(self.get_storage_disks)
+        self.app.get("/v1/storage/models")(self.get_storage_models)
+        self.app.get("/v1/storage/streaming")(self.get_storage_streaming)
         self.app.post("/models/add")(self.add_custom_model)
         self.app.delete("/models/custom/{model_id:path}")(self.delete_custom_model)
         self.app.get("/models/search")(self.search_models)
@@ -1752,6 +1762,114 @@ class API:
             ]
         )
 
+    def _node_friendly_name(self, node_id: NodeId) -> str:
+        identity = self.state.node_identities.get(node_id)
+        if identity is not None and identity.friendly_name != "Unknown":
+            return identity.friendly_name
+        return str(node_id)[:8]
+
+    async def get_storage_disks(self) -> StorageDiskList:
+        """Per-shelf disk usage across nodes (read-only dashboard).
+
+        Reports one entry per configured models directory ("shelf") on each
+        node — writable dirs plus any read-only/shared mounts. Falls back to the
+        single default-dir usage for nodes that haven't reported shelves yet.
+        """
+        disks: list[StorageDisk] = []
+        for node_id, shelves in self.state.node_disks.items():
+            for shelf in shelves:
+                total = shelf.total.in_bytes
+                available = shelf.available.in_bytes
+                disks.append(
+                    StorageDisk(
+                        node_id=node_id,
+                        friendly_name=self._node_friendly_name(node_id),
+                        path=shelf.path,
+                        read_only=shelf.read_only,
+                        total_bytes=total,
+                        available_bytes=available,
+                        used_bytes=max(total - available, 0),
+                    )
+                )
+        # Fall back to the single default-dir usage for any node without shelves.
+        for node_id, usage in self.state.node_disk.items():
+            if node_id in self.state.node_disks and self.state.node_disks[node_id]:
+                continue
+            total = usage.total.in_bytes
+            available = usage.available.in_bytes
+            disks.append(
+                StorageDisk(
+                    node_id=node_id,
+                    friendly_name=self._node_friendly_name(node_id),
+                    total_bytes=total,
+                    available_bytes=available,
+                    used_bytes=max(total - available, 0),
+                )
+            )
+        disks.sort(key=lambda d: (d.friendly_name, d.path))
+        return StorageDiskList(data=disks)
+
+    async def get_storage_models(self) -> StorageModelList:
+        """Where every downloaded model lives across nodes (read-only dashboard).
+
+        Built from completed-download records in cluster state, so it reflects
+        each node's view of which models it holds and whether the copy is on a
+        read-only (e.g. shared/remote) path.
+        """
+        by_model: dict[str, list[StorageModelLocation]] = {}
+        for node_id, node_downloads in self.state.downloads.items():
+            for dl in node_downloads:
+                if not isinstance(dl, DownloadCompleted):
+                    continue
+                model_id = str(dl.shard_metadata.model_card.model_id)
+                by_model.setdefault(model_id, []).append(
+                    StorageModelLocation(
+                        node_id=node_id,
+                        friendly_name=self._node_friendly_name(node_id),
+                        model_directory=dl.model_directory,
+                        size_bytes=dl.total.in_bytes,
+                        read_only=dl.read_only,
+                    )
+                )
+
+        models: list[StorageModel] = []
+        for model_id, locations in by_model.items():
+            locations.sort(key=lambda loc: (loc.read_only, loc.friendly_name))
+            physical = [loc for loc in locations if not loc.read_only]
+            models.append(
+                StorageModel(
+                    model_id=model_id,
+                    locations=locations,
+                    physical_copies=len(physical),
+                    locations_count=len(locations),
+                    # Count bytes for physical copies only — read-only locations
+                    # are remote views of the same bytes, not extra storage.
+                    total_bytes=sum(loc.size_bytes for loc in physical),
+                )
+            )
+        models.sort(key=lambda m: m.model_id)
+        return StorageModelList(data=models)
+
+    async def get_storage_streaming(self) -> StreamingStatus:
+        """Per-node tensor-parallel weight-streaming configuration.
+
+        ``enabled`` is true only when every reporting node has
+        EXO_TP_STREAM_WEIGHTS set. Streaming is a load-time setting, so changing
+        it takes effect on the next model load rather than for a loaded model.
+        """
+        nodes: list[StreamingNodeStatus] = []
+        for node_id, identity in self.state.node_identities.items():
+            nodes.append(
+                StreamingNodeStatus(
+                    node_id=node_id,
+                    friendly_name=self._node_friendly_name(node_id),
+                    tp_stream_weights=identity.tp_stream_weights,
+                )
+            )
+        nodes.sort(key=lambda n: n.friendly_name)
+        enabled = bool(nodes) and all(n.tp_stream_weights for n in nodes)
+        return StreamingStatus(enabled=enabled, nodes=nodes)
+
     async def add_custom_model(self, payload: AddCustomModelParams) -> ModelListModel:
         """Fetch a model from HuggingFace and save as a custom model card, then sync across the cluster."""
         try:
@@ -1967,6 +2085,7 @@ class API:
         command = StartDownload(
             target_node_id=payload.target_node_id,
             shard_metadata=payload.shard_metadata,
+            dest_dir=payload.dest_dir,
         )
         await self._send_download(command)
         return StartDownloadResponse(command_id=command.command_id)

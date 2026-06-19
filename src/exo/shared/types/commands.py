@@ -70,6 +70,9 @@ class RequestEventLog(BaseCommand):
 class StartDownload(BaseCommand):
     target_node_id: NodeId
     shard_metadata: ShardMetadata
+    # Optional explicit destination shelf (a writable models dir on the target
+    # node). When None, the node auto-selects the first writable dir with space.
+    dest_dir: str | None = None
 
 
 class DeleteDownload(BaseCommand):

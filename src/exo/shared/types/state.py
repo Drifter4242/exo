@@ -10,6 +10,7 @@ from exo.shared.topology import Topology, TopologySnapshot
 from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
+    DiskShelf,
     DiskUsage,
     MemoryUsage,
     NodeIdentity,
@@ -54,6 +55,9 @@ class State(FrozenModel):
     node_identities: Mapping[NodeId, NodeIdentity] = {}
     node_memory: Mapping[NodeId, MemoryUsage] = {}
     node_disk: Mapping[NodeId, DiskUsage] = {}
+    # Per-shelf disk usage (one entry per configured models dir, deduped by
+    # partition). Reported alongside node_disk for the storage dashboard.
+    node_disks: Mapping[NodeId, Sequence[DiskShelf]] = {}
     node_system: Mapping[NodeId, SystemPerformanceProfile] = {}
     node_network: Mapping[NodeId, NodeNetworkInfo] = {}
     node_thunderbolt: Mapping[NodeId, NodeThunderboltInfo] = {}

@@ -300,6 +300,9 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
     node_disk = {
         key: value for key, value in state.node_disk.items() if key != event.node_id
     }
+    node_disks = {
+        key: value for key, value in state.node_disks.items() if key != event.node_id
+    }
     node_system = {
         key: value for key, value in state.node_system.items() if key != event.node_id
     }
@@ -336,6 +339,7 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
             "last_seen": last_seen,
             "node_memory": node_memory,
             "node_disk": node_disk,
+            "node_disks": node_disks,
             "node_system": node_system,
             "node_network": node_network,
             "node_thunderbolt": node_thunderbolt,
@@ -371,12 +375,19 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
             update["node_memory"] = {**state.node_memory, event.node_id: info}
         case NodeDiskUsage():
             update["node_disk"] = {**state.node_disk, event.node_id: info.disk_usage}
+            update["node_disks"] = {
+                **state.node_disks,
+                event.node_id: info.shelves,
+            }
         case NodeConfig():
             pass
         case MiscData():
             current_identity = state.node_identities.get(event.node_id, NodeIdentity())
             new_identity = current_identity.model_copy(
-                update={"friendly_name": info.friendly_name}
+                update={
+                    "friendly_name": info.friendly_name,
+                    "tp_stream_weights": info.tp_stream_weights,
+                }
             )
             update["node_identities"] = {
                 **state.node_identities,

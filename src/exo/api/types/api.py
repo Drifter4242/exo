@@ -56,6 +56,73 @@ class ModelList(BaseModel):
     data: list[ModelListModel]
 
 
+class StorageDisk(BaseModel):
+    """Disk-usage summary for a single shelf (configured models dir) on a node."""
+
+    node_id: NodeId
+    friendly_name: str = ""
+    path: str = ""
+    read_only: bool = False
+    total_bytes: int = 0
+    available_bytes: int = 0
+    used_bytes: int = 0
+
+
+class StorageDiskList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[StorageDisk]
+
+
+class StorageModelLocation(BaseModel):
+    """Where a single copy of a model lives on a specific node."""
+
+    node_id: NodeId
+    friendly_name: str = ""
+    model_directory: str = ""
+    size_bytes: int = 0
+    read_only: bool = False
+
+
+class StorageModel(BaseModel):
+    """A model and every node/disk it is currently stored on."""
+
+    model_id: str
+    locations: list[StorageModelLocation] = Field(default_factory=list)
+    # Number of distinct physical copies (writable locations). Read-only
+    # locations are remote *views* of another node's copy (e.g. an SMB mount of
+    # a shared drive), so they are listed but not counted as separate copies.
+    physical_copies: int = 0
+    # Total number of locations that can see the model (writable + read-only).
+    locations_count: int = 0
+    total_bytes: int = 0
+
+
+class StorageModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[StorageModel]
+
+
+class StreamingNodeStatus(BaseModel):
+    """Whether a node is configured to stream tensor-parallel weights."""
+
+    node_id: NodeId
+    friendly_name: str = ""
+    tp_stream_weights: bool = False
+
+
+class StreamingStatus(BaseModel):
+    """Cluster-wide tensor-parallel weight-streaming status.
+
+    ``enabled`` is true only when every node reporting in is configured to
+    stream (EXO_TP_STREAM_WEIGHTS). Streaming is a load-time setting — changes
+    take effect on the next model load, not for an already-loaded model.
+    """
+
+    object: Literal["streaming_status"] = "streaming_status"
+    enabled: bool = False
+    nodes: list[StreamingNodeStatus] = Field(default_factory=list)
+
+
 class ChatCompletionMessageText(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -432,6 +499,9 @@ class ImageListResponse(BaseModel, frozen=True):
 class StartDownloadParams(FrozenModel):
     target_node_id: NodeId
     shard_metadata: ShardMetadata
+    # Optional explicit destination shelf (a writable models dir on the target
+    # node). When None, the node auto-selects a writable dir with free space.
+    dest_dir: str | None = None
 
 
 class StartDownloadResponse(FrozenModel):

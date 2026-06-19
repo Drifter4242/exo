@@ -13,9 +13,15 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
 from pydantic import ValidationError
 
-from exo.shared.constants import EXO_CONFIG_FILE, EXO_DEFAULT_MODELS_DIR
+from exo.shared.constants import (
+    EXO_CONFIG_FILE,
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_MODELS_DIRS,
+    EXO_MODELS_READ_ONLY_DIRS,
+)
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
+    DiskShelf,
     DiskUsage,
     MemoryUsage,
     NetworkInterfaceInfo,
@@ -313,23 +319,72 @@ class MiscData(TaggedModel):
     """Node information that may slowly change that doesn't fall into the other categories"""
 
     friendly_name: str
+    tp_stream_weights: bool = False
 
     @classmethod
     async def gather(cls) -> Self:
-        return cls(friendly_name=await get_friendly_name())
+        tp_stream = os.environ.get("EXO_TP_STREAM_WEIGHTS", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        return cls(
+            friendly_name=await get_friendly_name(),
+            tp_stream_weights=tp_stream,
+        )
 
 
 class NodeDiskUsage(TaggedModel):
-    """Disk space information for the models directory."""
+    """Disk space information for the models directories."""
 
     disk_usage: DiskUsage
+    shelves: Sequence[DiskShelf] = []
+
+    @classmethod
+    def _gather_shelves(cls) -> list[DiskShelf]:
+        """One DiskShelf per configured models dir, deduped by partition.
+
+        Writable dirs (EXO_MODELS_DIRS) come first, then read-only dirs
+        (EXO_MODELS_READ_ONLY_DIRS). Dirs that do not exist on disk are skipped.
+        Two configured dirs on the same physical partition are reported once
+        (the first/writable one wins).
+        """
+        seen_devices: set[int] = set()
+        shelves: list[DiskShelf] = []
+        candidates = [(d, False) for d in EXO_MODELS_DIRS] + [
+            (d, True) for d in EXO_MODELS_READ_ONLY_DIRS
+        ]
+        for path, read_only in candidates:
+            try:
+                dev = path.stat().st_dev
+            except OSError:
+                # Dir doesn't exist / not mounted yet — skip it.
+                continue
+            if dev in seen_devices:
+                continue
+            seen_devices.add(dev)
+            try:
+                usage = DiskUsage.from_path(path)
+            except OSError:
+                continue
+            shelves.append(
+                DiskShelf(
+                    path=str(path),
+                    total=usage.total,
+                    available=usage.available,
+                    read_only=read_only,
+                )
+            )
+        return shelves
 
     @classmethod
     async def gather(cls) -> Self:
         return cls(
             disk_usage=await to_thread.run_sync(
                 DiskUsage.from_path, EXO_DEFAULT_MODELS_DIR
-            )
+            ),
+            shelves=await to_thread.run_sync(cls._gather_shelves),
         )
 
 
