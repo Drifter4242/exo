@@ -18,7 +18,10 @@ from exo.shared.types.worker.shards import (
 class ShardDownloader(ABC):
     @abstractmethod
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        dest_dir: Path | None = None,
     ) -> Path:
         """
         Ensures that the shard is downloaded.
@@ -56,7 +59,10 @@ class ShardDownloader(ABC):
 
 class NoopShardDownloader(ShardDownloader):
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        dest_dir: Path | None = None,
     ) -> Path:
         return Path("/tmp/noop_shard")
 

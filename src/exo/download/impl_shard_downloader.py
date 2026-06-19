@@ -68,11 +68,14 @@ class SingletonShardDownloader(ShardDownloader):
         self.shard_downloader.on_progress(callback)
 
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        dest_dir: Path | None = None,
     ) -> Path:
         if shard not in self.active_downloads:
             self.active_downloads[shard] = asyncio.create_task(
-                self.shard_downloader.ensure_shard(shard, config_only)
+                self.shard_downloader.ensure_shard(shard, config_only, dest_dir)
             )
         try:
             return await self.active_downloads[shard]
@@ -113,7 +116,10 @@ class ResumableShardDownloader(ShardDownloader):
         self.on_progress_callbacks.append(callback)
 
     async def ensure_shard(
-        self, shard: ShardMetadata, config_only: bool = False
+        self,
+        shard: ShardMetadata,
+        config_only: bool = False,
+        dest_dir: Path | None = None,
     ) -> Path:
         allow_patterns = ["config.json"] if config_only else None
 
@@ -137,6 +143,7 @@ class ResumableShardDownloader(ShardDownloader):
             max_parallel_downloads=self.max_parallel_downloads,
             allow_patterns=allow_patterns,
             skip_internet=self.offline,
+            dest_dir=dest_dir,
         )
 
         if has_vision_sibling:
@@ -153,6 +160,7 @@ class ResumableShardDownloader(ShardDownloader):
                 max_parallel_downloads=self.max_parallel_downloads,
                 allow_patterns=["*.safetensors", "config.json"],
                 skip_internet=self.offline,
+                dest_dir=dest_dir,
             )
 
         return target_dir

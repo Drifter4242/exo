@@ -873,6 +873,7 @@ async def download_shard(
     skip_internet: bool = False,
     allow_patterns: list[str] | None = None,
     on_connection_lost: Callable[[], None] = lambda: None,
+    dest_dir: Path | None = None,
 ) -> tuple[Path, RepoDownloadProgress]:
     if not skip_download:
         logger.debug(f"Downloading {shard.model_card.model_id=}")
@@ -939,9 +940,14 @@ async def download_shard(
             else EXO_DEFAULT_MODELS_DIR / model_id.normalize()
         )
     else:
-        models_dir = await select_download_dir_for_shard(
-            model_id, filtered_file_list, total_size
-        )
+        if dest_dir is not None:
+            # Caller chose an explicit destination shelf (already validated as a
+            # writable models dir on this node).
+            models_dir = dest_dir
+        else:
+            models_dir = await select_download_dir_for_shard(
+                model_id, filtered_file_list, total_size
+            )
         target_dir = models_dir / model_id.normalize()
         await aios.makedirs(target_dir, exist_ok=True)
     file_progress: dict[str, RepoFileDownloadProgress] = {}

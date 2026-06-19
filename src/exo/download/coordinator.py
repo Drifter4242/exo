@@ -15,7 +15,11 @@ from exo.download.download_utils import (
     resolve_existing_model,
 )
 from exo.download.shard_downloader import ShardDownloader
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_MODELS_READ_ONLY_DIRS
+from exo.shared.constants import (
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_MODELS_DIRS,
+    EXO_MODELS_READ_ONLY_DIRS,
+)
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.commands import (
@@ -154,8 +158,8 @@ class DownloadCoordinator:
                     continue
 
                 match cmd.command:
-                    case StartDownload(shard_metadata=shard):
-                        await self._start_download(shard)
+                    case StartDownload(shard_metadata=shard, dest_dir=dest_dir):
+                        await self._start_download(shard, dest_dir)
                     case DeleteDownload(model_id=model_id):
                         await self._delete_download(model_id)
                     case CancelDownload(model_id=model_id):
@@ -183,8 +187,33 @@ class DownloadCoordinator:
                 NodeDownloadProgress(download_progress=pending)
             )
 
-    async def _start_download(self, shard: ShardMetadata) -> None:
+    async def _start_download(
+        self, shard: ShardMetadata, dest_dir: str | None = None
+    ) -> None:
         model_id = shard.model_card.model_id
+
+        # Validate an explicit destination shelf, if one was requested. It must
+        # be one of this node's writable model dirs; reject read-only/unknown
+        # paths so a caller can't write outside configured storage.
+        resolved_dest: Path | None = None
+        if dest_dir is not None:
+            resolved_dest = self._validate_dest_dir(dest_dir)
+            if resolved_dest is None:
+                writable = [str(d) for d in EXO_MODELS_DIRS]
+                failed = DownloadFailed(
+                    shard_metadata=shard,
+                    node_id=self.node_id,
+                    error_message=(
+                        f"Requested destination {dest_dir!r} is not a writable "
+                        f"models directory on this node. Writable shelves: {writable}"
+                    ),
+                    model_directory=self._default_model_dir(model_id),
+                )
+                self.download_status[model_id] = failed
+                await self.event_sender.send(
+                    NodeDownloadProgress(download_progress=failed)
+                )
+                return
 
         # Check if already downloading, complete, or recently failed
         if model_id in self.download_status:
@@ -260,10 +289,32 @@ class DownloadCoordinator:
             return
 
         # Start actual download
-        self._start_download_task(shard, initial_progress)
+        self._start_download_task(shard, initial_progress, resolved_dest)
+
+    def _validate_dest_dir(self, dest_dir: str) -> Path | None:
+        """Return the resolved Path if dest_dir is a writable shelf, else None.
+
+        Accepts a path that equals (or lives under) one of this node's writable
+        model dirs (EXO_MODELS_DIRS). Read-only dirs are rejected.
+        """
+        try:
+            requested = Path(dest_dir).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return None
+        for writable in EXO_MODELS_DIRS:
+            try:
+                w = writable.expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if requested == w:
+                return w
+        return None
 
     def _start_download_task(
-        self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
+        self,
+        shard: ShardMetadata,
+        initial_progress: RepoDownloadProgress,
+        dest_dir: Path | None = None,
     ) -> None:
         model_id = shard.model_card.model_id
 
@@ -274,7 +325,11 @@ class DownloadCoordinator:
             download_progress=map_repo_download_progress_to_download_progress_data(
                 initial_progress
             ),
-            model_directory=self._default_model_dir(model_id),
+            model_directory=(
+                str(dest_dir / model_id.normalize())
+                if dest_dir is not None
+                else self._default_model_dir(model_id)
+            ),
         )
         self.download_status[model_id] = status
         self.event_sender.send_nowait(NodeDownloadProgress(download_progress=status))
@@ -282,7 +337,7 @@ class DownloadCoordinator:
         async def download_wrapper(cancel_scope: anyio.CancelScope) -> None:
             try:
                 with cancel_scope:
-                    await self.shard_downloader.ensure_shard(shard)
+                    await self.shard_downloader.ensure_shard(shard, dest_dir=dest_dir)
             except Exception as e:
                 logger.error(f"Download failed for {model_id}: {e}")
                 failed = DownloadFailed(
