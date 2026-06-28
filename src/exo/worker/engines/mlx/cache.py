@@ -530,6 +530,17 @@ class KVPrefixCache:
         h = hashlib.sha256(np.asarray(tokens).tobytes()).hexdigest()[:16]
         return self._get_disk_dir() / f"{h}_r{self._rank}.safetensors"  # type: ignore[operator]
 
+    def _touch_disk_entry(self, index: int) -> None:
+        """Update the disk file's mtime on a cache hit so eviction is true LRU."""
+        if self._disk_dir is None:
+            return
+        try:
+            path = self._entry_path(self.prompts[index])
+            if path.exists():
+                os.utime(path, None)
+        except OSError:
+            pass
+
     def _save_entry_async(self, index: int) -> None:
         """Build + evaluate arrays on the main thread, then write to disk in background."""
         if self._save_executor is None:
@@ -546,15 +557,54 @@ class KVPrefixCache:
             return
 
         # Build arrays dict here (main thread) so we can eval on the GPU stream
+        #
+        # Cache layout:
+        #   Standard models:  [KVCache, KVCache, ...]
+        #   GLM-5.2 (DSA):    [CacheList(KVCache, KVCache), ...]
+        # We handle both by checking for CacheList and iterating inner caches.
+        # Key scheme:
+        #   Flat:    layer_{i}_k / layer_{i}_v
+        #   Nested:  layer_{i}_sub_{j}_k / layer_{i}_sub_{j}_v
         arrays: dict[str, mx.array] = {}
         offsets: dict[str, int] = {}
+        sub_counts: dict[str, int] = {}  # number of inner caches per layer
+        # Shape + dtype of every k/v we serialize, INCLUDING zero-length ones.
+        # safetensors refuses to serialize an empty array, and GLM-5.2 DSA layers
+        # have asymmetric inner caches — e.g. the indexer sub-cache holds keys
+        # (offset > 0) but a zero-length values tensor. We therefore record a spec
+        # for every array, persist only the non-empty ones, and recreate the empty
+        # ones from their spec on load. (Previously this raised "Cannot serialize an
+        # empty array (layer_..._sub_1_v)" and left a 0-byte file → no persistence.)
+        array_specs: dict[str, list] = {}  # name -> [shape, dtype_name]
+
+        def _record(name: str, t: mx.array) -> None:
+            array_specs[name] = [list(t.shape), str(t.dtype).split(".")[-1]]
+            if t.size > 0:
+                arrays[name] = t
+
         for i, c in enumerate(cache):
-            if not isinstance(c, KVCache) or c.keys is None:
+            inner_caches: list[KVCache] = []
+            if isinstance(c, CacheList):
+                inner_caches = [ic for ic in c.caches if isinstance(ic, KVCache)]
+                sub_counts[str(i)] = len(inner_caches)
+            elif isinstance(c, KVCache):
+                inner_caches = [c]
+                sub_counts[str(i)] = 0  # 0 = flat (single KVCache, not CacheList)
+            else:
                 continue
-            n = c.offset
-            arrays[f"layer_{i}_k"] = c.keys[..., :n, :]
-            arrays[f"layer_{i}_v"] = c.values[..., :n, :]
-            offsets[str(i)] = n
+
+            for j, ic in enumerate(inner_caches):
+                if ic.keys is None:
+                    continue
+                n = ic.offset
+                if sub_counts[str(i)] > 0:
+                    kname, vname = f"layer_{i}_sub_{j}_k", f"layer_{i}_sub_{j}_v"
+                else:
+                    kname, vname = f"layer_{i}_k", f"layer_{i}_v"
+                _record(kname, ic.keys[..., :n, :])
+                if ic.values is not None:
+                    _record(vname, ic.values[..., :n, :])
+                offsets[str(i)] = n
         if not arrays:
             return
         arrays["tokens"] = tokens
@@ -569,6 +619,8 @@ class KVPrefixCache:
             "prefill_tps": str(prefill_tps),
             "saved_at": str(time.time()),
             "n_layers": str(len(cache)),
+            "sub_counts": json.dumps(sub_counts),
+            "array_specs": json.dumps(array_specs),
         }
         path = self._entry_path(tokens)
         self._save_executor.submit(self._write_to_disk, arrays, meta, path)
@@ -592,21 +644,36 @@ class KVPrefixCache:
             logger.exception("KV disk cache: write failed")
 
     def _load_from_disk(self) -> None:
-        """Load all matching saved cache entries from disk on startup."""
+        """Load saved cache entries for this model from disk on startup.
+
+        Entries are loaded most-recently-used first (file mtime) and only up
+        to EXO_DISK_CACHE_LOAD_GB (default 50) of file bytes are materialized
+        into memory. Remaining entries stay on disk untouched.
+        """
         cdir = self._get_disk_dir()
         if cdir is None:
             return
-        files = sorted(cdir.glob(f"*_r{self._rank}.safetensors"))
+        files = sorted(
+            cdir.glob(f"*_r{self._rank}.safetensors"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if not files:
             logger.info(f"KV disk cache: no saved entries found (dir={cdir})")
             return
+        load_budget = float(os.environ.get("EXO_DISK_CACHE_LOAD_GB", "50")) * 1e9
+        loaded_bytes = 0
         loaded = 0
         skipped = 0
         for path in files:
             try:
+                size = path.stat().st_size
+                if loaded_bytes + size > load_budget:
+                    skipped += 1
+                    continue
                 arrays, meta = mx.load(str(path), return_metadata=True)
                 if meta.get("model_id", "") != self._model_id:
-                    logger.info(
+                    logger.debug(
                         f"KV disk cache: skipping {path.name} "
                         f"(model_id {meta.get('model_id')!r} != {self._model_id!r})"
                     )
@@ -616,23 +683,79 @@ class KVPrefixCache:
                 prefill_tps = float(meta.get("prefill_tps", 0.0))
                 tokens = arrays["tokens"]
 
-                rebuilt: list[KVCache] = []
-                for i in range(n_layers):
-                    k_key = f"layer_{i}_k"
-                    v_key = f"layer_{i}_v"
-                    if k_key not in arrays:
-                        rebuilt.append(
-                            KVCache()
-                        )  # empty placeholder for skipped layers
-                        continue
-                    c = KVCache()
-                    c.state = (arrays[k_key], arrays[v_key])
-                    rebuilt.append(c)
+                # sub_counts: {layer_index_str: num_inner_caches}
+                # 0 = flat KVCache (standard models), >0 = CacheList (GLM-5.2 DSA)
+                sub_counts: dict[str, int] = {}
+                if "sub_counts" in meta:
+                    try:
+                        sub_counts = json.loads(meta["sub_counts"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-                # Trigger eval so tensors are resident before first use
-                to_eval = [c.keys for c in rebuilt if c.keys is not None] + [
-                    c.values for c in rebuilt if c.values is not None
-                ]
+                # array_specs lets us recreate zero-length arrays that were not
+                # serialized (safetensors can't store them). Maps name -> [shape, dtype].
+                array_specs: dict[str, list] = {}
+                if "array_specs" in meta:
+                    try:
+                        array_specs = json.loads(meta["array_specs"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                def _materialize(name: str):
+                    """Return the saved array, or recreate an empty one from its spec."""
+                    if name in arrays:
+                        return arrays[name]
+                    spec = array_specs.get(name)
+                    if spec is None:
+                        return None
+                    shape, dtype_name = spec
+                    dt = getattr(mx, dtype_name, mx.float16)
+                    return mx.zeros(tuple(shape), dtype=dt)
+
+                def _rebuild_kv(k_key: str, v_key: str) -> "KVCache | None":
+                    k = _materialize(k_key)
+                    if k is None:
+                        return None
+                    v = _materialize(v_key)
+                    if v is None:
+                        # keys present, values absent (no spec): empty values matching k.
+                        v = mx.zeros((*k.shape[:-2], 0, k.shape[-1]), dtype=k.dtype)
+                    c = KVCache()
+                    c.state = (k, v)
+                    return c
+
+                rebuilt: list[KVCache | CacheList] = []
+                for i in range(n_layers):
+                    sc = sub_counts.get(str(i), 0)
+
+                    if sc > 0:
+                        # CacheList layer (GLM-5.2 DSA): reconstruct from
+                        # layer_{i}_sub_{j}_k / layer_{i}_sub_{j}_v
+                        inner: list[KVCache] = []
+                        for j in range(sc):
+                            kv = _rebuild_kv(
+                                f"layer_{i}_sub_{j}_k", f"layer_{i}_sub_{j}_v"
+                            )
+                            inner.append(kv if kv is not None else KVCache())
+                        rebuilt.append(CacheList(*inner))
+                    else:
+                        # Flat KVCache layer (standard models)
+                        kv = _rebuild_kv(f"layer_{i}_k", f"layer_{i}_v")
+                        rebuilt.append(kv if kv is not None else KVCache())
+
+                # Trigger eval so tensors are resident before first use.
+                # For CacheList layers, pull keys/values from inner caches.
+                to_eval = []
+                for c in rebuilt:
+                    if isinstance(c, CacheList):
+                        for ic in c.caches:
+                            if ic.keys is not None:
+                                to_eval.append(ic.keys)
+                            if ic.values is not None:
+                                to_eval.append(ic.values)
+                    elif c.keys is not None:
+                        to_eval.append(c.keys)
+                        to_eval.append(c.values)
                 if to_eval:
                     mx.eval(*to_eval)
 
@@ -644,11 +767,13 @@ class KVPrefixCache:
                 self._access_counter += 1
                 self._last_used.append(self._access_counter)
                 loaded += 1
+                loaded_bytes += size
             except Exception:
                 logger.exception(f"KV disk cache: failed to load {path.name}, skipping")
                 skipped += 1
         logger.info(
-            f"KV disk cache: loaded {loaded} entries, skipped {skipped} (dir={cdir})"
+            f"KV disk cache: loaded {loaded} entries "
+            f"({loaded_bytes / 1e9:.2f} GB), skipped {skipped} (dir={cdir})"
         )
 
     def _evict_disk_if_needed(self) -> None:
@@ -820,6 +945,7 @@ class KVPrefixCache:
                     shift_kv_cache(prompt_cache, delta, *rope_cfg)
                     self._access_counter += 1
                     self._last_used[i] = self._access_counter
+                    self._touch_disk_entry(i)
                     remaining = prompt_tokens[match_len:]
                     return prompt_cache, remaining, i, False
 
@@ -862,6 +988,7 @@ class KVPrefixCache:
 
         self._access_counter += 1
         self._last_used[best_index] = self._access_counter
+        self._touch_disk_entry(best_index)
         remaining = prompt_tokens[restore_pos:]
 
         return prompt_cache, remaining, best_index, is_exact
